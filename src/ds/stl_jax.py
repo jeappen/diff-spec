@@ -488,11 +488,22 @@ class STL:
             )
         # mask condition, once condition > 0 (after until True),
         # the right sequence is no longer considered
-        cond = (till_pred > 0).int()
+        cond = (till_pred > 0).astype(int)
         index = jnp.argmax(cond, axis=-1)
-        for i in range(cond.shape[0]):
-            cond[i, index[i]:] = 1.0
-        cond = ~cond.bool()
+
+        batch_size, seq_len = cond.shape
+        row_indices = jnp.arange(batch_size)[:, None]
+        col_indices = jnp.arange(seq_len)
+
+        mask = col_indices >= index[:, None]
+
+        # Apply the mask
+        cond = mask.astype(int)
+        cond = ~cond.astype(bool)
+
+        # for i in range(cond.shape[0]):
+        #     cond[i, index[i]:] = 1.0
+        # cond = ~cond.astype(bool)
         till_pred = jnp.where(cond, till_pred, ds_utils.default_tensor(1))
 
         if self._is_leaf(sub_form1):
