@@ -28,6 +28,7 @@ inside_npy = ds_utils.inside_rectangle_formula
 import jax.numpy as jnp
 import re
 
+
 class PredicateBase:
     def __init__(self, name: str):
         self.name = name
@@ -50,6 +51,10 @@ class PredicateBase:
 
     def __str__(self) -> str:
         return self.name
+
+    def __lt__(self, other: "PredicateBase") -> bool:
+        """Sort predicates by name."""
+        return self.name < other.name
 
 
 class RectReachPredicate(PredicateBase):
@@ -671,6 +676,7 @@ class STL:
 
     def latex_repr(self):
         repr = self.__repr__()
+
         def replace_special_chars(match):
             return {
                 "~": r"\neg",
@@ -681,6 +687,7 @@ class STL:
                 "F": r"\Diamond",
                 "U": r"U",
             }[match.group(0)]
+
         replaced_symb = re.sub(r"~|&|\||->|G|F|U", replace_special_chars, repr)
         # replace any [a, b] with _{[a,b]}
         replaced_symb = re.sub(r"\[(\d+), (\d+)\]", r"_{[\1,\2]}", replaced_symb)
