@@ -51,6 +51,26 @@ class PredicateBase:
     def __str__(self) -> str:
         return self.name
 
+    def __lt__(self, other):
+        return self.name < other.name
+
+import jax
+@jax.jit
+def softnorm(x):
+    """Compute the 2-norm, but if x is too small replace it with the squared 2-norm
+    to make sure it's differentiable. This function is continuous and has a derivative
+    that is defined everywhere, but its derivative is discontinuous.
+    """
+    eps = 1e-5
+    scaled_square = lambda x: (eps * (x / eps) ** 2).sum()
+    return jax.lax.cond(jnp.linalg.norm(x) >= eps, jnp.linalg.norm, scaled_square, x)
+
+# Try importing
+try:
+    import architect.components.specifications.stl as architect_stl
+except ImportError:
+    print("architect-rss-22 not found")
+    architect_stl = None
 
 class RectReachPredicate(PredicateBase):
     """
@@ -90,6 +110,13 @@ class RectReachPredicate(PredicateBase):
             [self.cent - self.size * self.shrink_factor / 2, self.cent + self.size * self.shrink_factor / 2]
         ).T.flatten()
         return inside_npy(bounds, 0, 1, 2, self.name)
+
+
+    def get_architect_form(self) -> STLTree:
+        """Use Numpy to ensure compatibility with STLpy."""
+        min_waiting_radius  = 0.5 * self.shrink_factor
+        return architect_stl.STLPredicate(lambda q_t: -softnorm(q_t[:2] - self.cent), min_waiting_radius)
+        # return inside_npy(bounds, 0, 1, 2, self.name)
 
 
 class RectAvoidPredicate(PredicateBase):
