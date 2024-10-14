@@ -1,10 +1,9 @@
 # %%
-import os
-
+import importlib
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
-import importlib
+import os
 
 import ds.utils as ds_utils
 
@@ -12,11 +11,13 @@ import ds.utils as ds_utils
 if os.environ.get("DIFF_STL_BACKEND") == "jax":
     print("Using JAX backend")
     from ds.stl_jax import STL, RectAvoidPredicate, RectReachPredicate
+
     importlib.reload(ds_utils)  # Reload the module to reset the backend
     import jax
 else:
     print("Using PyTorch backend")
     from ds.stl import STL, RectAvoidPredicate, RectReachPredicate
+
     importlib.reload(ds_utils)  # Reload the module to reset the backend
     import torch
     from torch.optim import Adam
@@ -29,9 +30,9 @@ def eval_reach_avoid(mute=False):
 
     # Define the formula predicates
     # goal is a rectangle area centered in [0, 0] with width and height 1
-    goal = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1]), "goal"))
+    goal = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1])))
     # obs is a rectangle area centered in [3, 2] with width and height 1
-    obs = STL(RectAvoidPredicate(np.array([3, 2]), np.array([1, 1]), "obs"))
+    obs = STL(RectAvoidPredicate(np.array([3, 2]), np.array([1, 1])))
     # form is the formula goal eventually in 0 to 10 and avoid obs always in 0 to 10
     form = goal.eventually(0, 10) & obs.always(0, 10)
 
@@ -93,9 +94,9 @@ def backward(mute=True):
 
     # Define the formula predicates
     # goal_1 is a rectangle area centered in [0, 0] with width and height 1
-    goal_1 = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1]), "goal_1"))
+    goal_1 = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1])))
     # goal_2 is a rectangle area centered in [2, 2] with width and height 1
-    goal_2 = STL(RectReachPredicate(np.array([2, 2]), np.array([1, 1]), "goal_2"))
+    goal_2 = STL(RectReachPredicate(np.array([2, 2]), np.array([1, 1])))
 
     # form is the formula goal_1 eventually in 0 to 5 and goal_2 eventually in 0 to 5
     # and that holds always in 0 to 8
@@ -135,7 +136,7 @@ def backward(mute=True):
         @jax.jit
         def train_step(params, solver_state):
             # Performs a one step update.
-            (loss), grad = jax.value_and_grad(lambda x : -form.eval(x).mean())(
+            (loss), grad = jax.value_and_grad(lambda x: -form.eval(x).mean())(
                 params
             )
             updates, solver_state = solver.update(grad, solver_state)

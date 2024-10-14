@@ -20,13 +20,16 @@ class TestJAXExamples(unittest.TestCase):
         importlib.reload(stl_diff_examples)  # Reload the module to reset the backend
         importlib.reload(ds_utils)  # Reload the module to reset the backend
 
-        self.goal_1 = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1]), "goal_1"))
+        self.goal_1 = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1])))
         # goal_2 is a rectangle area centered in [2, 2] with width and height 1
-        self.goal_2 = STL(RectReachPredicate(np.array([2, 2]), np.array([1, 1]), "goal_2"))
+        self.goal_2 = STL(RectReachPredicate(np.array([2, 2]), np.array([1, 1])))
 
         # form is the formula goal_1 eventually in 0 to 5 and goal_2 eventually in 0 to 5
         # and that holds always in 0 to 8
         # In other words, the path will repeatedly visit goal_1 and goal_2 in 0 to 13
+        os.environ["WANDB_MODE"] = "disabled"
+        os.environ["JAX_DISABLE_JIT"] = "True"
+        jax.config.update("jax_disable_jit", True)
         self.form = (self.goal_1.eventually(0, 5) & self.goal_2.eventually(0, 5)).always(0, 8)
         self.loop_form = (self.goal_1.eventually(0, 4) & self.goal_2.eventually(0, 4)).always(0, 8)
         self.cover_form = self.goal_1.eventually(0, 12) & self.goal_2.eventually(0, 12)

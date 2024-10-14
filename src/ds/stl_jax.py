@@ -1,7 +1,9 @@
 from collections import deque
 
+import functools
 import importlib
 import io
+import jax
 import numpy as np
 import os
 from abc import abstractmethod
@@ -30,7 +32,6 @@ import re
 
 
 class PredicateBase(NamedTuple):
-    name: str
 
     def eval_at_t(self, path: jnp.ndarray, t: int = 0) -> jnp.ndarray:
         return self.eval_whole_path(path, t, t + 1)[:, 0]
@@ -47,6 +48,10 @@ class PredicateBase(NamedTuple):
         """Use Numpy to ensure compatibility with STLpy."""
         raise NotImplementedError
 
+    @property
+    def name(self):
+        return "PredicateBase"
+
     def __str__(self) -> str:
         return self.name
 
@@ -55,6 +60,7 @@ class PredicateBase(NamedTuple):
         return self.name < other.name
 
 
+@jax.tree_util.register_static
 class RectangularPredicate(NamedTuple):
     """
         Rectangle reachability predicate
@@ -62,7 +68,6 @@ class RectangularPredicate(NamedTuple):
 
     cent: np.ndarray
     size: np.ndarray
-    name: str
     shrink_factor: float = 1.0  # shrink the rectangle to make it more conservative (for stlpy)
 
     @property
@@ -72,6 +77,20 @@ class RectangularPredicate(NamedTuple):
     @property
     def cent_tensor(self):
         return ds_utils.default_tensor(self.cent)
+
+    def eval_at_t(self, path: jnp.ndarray, t: int = 0) -> jnp.ndarray:
+        return self.eval_whole_path(path, t, t + 1)[:, 0]
+
+    @abstractmethod
+    def eval_whole_path(
+            self, path: jnp.ndarray, start_t: int = 0, end_t: int = None
+    ) -> jnp.ndarray:
+        """Stick to JAX when possible."""
+        raise NotImplementedError
+
+    @property
+    def name(self):
+        return str(self.cent)
 
     def __hash__(self):
         return hash((self.cent, self.size))
@@ -284,7 +303,10 @@ class LinearPredicate(baseLinearPredicate):
 
 AST = TypeVar("AST", list, PredicateBase)
 
+import jax.tree_util as jtu
 
+
+@jtu.register_pytree_node_class
 class STL:
     """
     Class for representing STL formulas.
@@ -294,44 +316,70 @@ class STL:
 
     def __init__(self, ast: AST):
         self.ast = ast
-        self.single_operators = ("~", "G", "F")
-        self.binary_operators = ("&", "|", "->", "U")
-        self.sequence_operators = ("G", "F", "U")
+
         self.stlpy_form = None
         self.expr_repr = None
         self.end_t = None  # Populated when evaluating
         self.logger = logging.getLogger(__name__)
+
+    @property
+    def single_operators(self):
+        return ("~", "G", "F")
+
+    @property
+    def binary_operators(self):
+        return ("&", "|", "->", "U")
+
+    @property
+    def sequence_operators(self):
+        return ("G", "F", "U")
+
+    @property
+    def op_map(self):
+        return {op: i for i, op in
+                enumerate(self.single_operators + self.binary_operators + self.sequence_operators)}
+
+    @property
+    def i_to_op(self):
+        return {v: k for k, v in self.op_map.items()}
+
+    def tree_flatten(self):
+        return ((self.ast), None)
+
+    @classmethod
+    def tree_unflatten(cls, aux_data, children):
+        return cls(*children)
 
     """
     Syntax Functions
     """
 
     def __and__(self, other: "STL") -> "STL":
-        ast = ["&", self.ast, other.ast]
+        ast = [self.op_map["&"], self.ast, other.ast]
         return STL(ast)
 
     def __or__(self, other: "STL") -> "STL":
-        ast = ["|", self.ast, other.ast]
+        ast = [self.op_map["|"], self.ast, other.ast]
         return STL(ast)
 
     def __invert__(self) -> "STL":
-        ast = ["~", self.ast]
+        ast = [self.op_map["~"], self.ast]
         return STL(ast)
 
     def implies(self, other: "STL") -> "STL":
-        ast = ["->", self.ast, other.ast]
+        ast = [self.op_map["->"], self.ast, other.ast]
         return STL(ast)
 
     def eventually(self, start: int, end: int):
-        ast = ["F", self.ast, start, end]
+        ast = [self.op_map["F"], self.ast, start, end]
         return STL(ast)
 
     def always(self, start: int, end: int) -> "STL":
-        ast = ["G", self.ast, start, end]
+        ast = [self.op_map["G"], self.ast, start, end]
         return STL(ast)
 
     def until(self, other: "STL", start: int, end: int) -> "STL":
-        ast = ["U", self.ast, other.ast, start, end]
+        ast = [self.op_map["U"], self.ast, other.ast, start, end]
         return STL(ast)
 
     def eval(self, path: jnp.array, t: int = 0) -> jnp.array:
@@ -358,10 +406,12 @@ class STL:
         # Is binary operator
         return max(self._get_end_time(ast[1]), self._get_end_time(ast[2]))
 
+    # @functools.partial(jax.jit, static_argnums=(0, 3, 4))
     def _eval(
             self, ast: AST, path: jnp.array, start_t: int = 0, end_t: int = None
     ) -> jnp.array:
         if self._is_leaf(ast):
+            # if isinstance(ast,RectangularPredicate):  # TODO: need a is_leaf
             return ast.eval_at_t(path, start_t)
 
         if ast[0] in self.sequence_operators:
@@ -371,21 +421,53 @@ class STL:
             if end_t > path.shape[1]:
                 self.logger.warning("end_t is larger than motion length")
 
-        if ast[0] == "&":
-            res = self._eval_and(ast[1], ast[2], path, start_t, end_t)
-        elif ast[0] == "|":
-            res = self._eval_or(ast[1], ast[2], path, start_t, end_t)
-        elif ast[0] == "~":
-            res = self._eval_not(ast[1], path, start_t, end_t)
-        elif ast[0] == "->":
-            res = self._eval_implies(ast[1], ast[2], path, start_t, end_t)
-        elif ast[0] == "G":
-            res = self._eval_always(ast[1], path, start_t, end_t)
-        elif ast[0] == "F":
-            res = self._eval_eventually(ast[1], path, start_t, end_t)
-        elif ast[0] == "U":
-            res = self._eval_until(ast[1], ast[2], path, start_t, end_t)
-        else:
+        # Get the index for the current operator
+        op_index = ast[0]  # TODO: Fix this traced value indexing
+
+        # Define a list of functions corresponding to each operation
+        def eval_and_case(_):
+            return self._eval_and(ast[1], ast[2], path, start_t, end_t)
+
+        def eval_or_case(_):
+            return self._eval_or(ast[1], ast[2], path, start_t, end_t)
+
+        def eval_not_case(_):
+            return self._eval_not(ast[1], path, start_t, end_t)
+
+        def eval_implies_case(_):
+            return self._eval_implies(ast[1], ast[2], path, start_t, end_t)
+
+        def eval_always_case(_):
+            return self._eval_always(ast[1], path, start_t, end_t)
+
+        def eval_eventually_case(_):
+            return self._eval_eventually(ast[1], path, start_t, end_t)
+
+        def eval_until_case(_):
+            return self._eval_until(ast[1], ast[2], path, start_t, end_t)
+
+        # List of functions for switch cases
+
+        dummy_fn = lambda _: None
+        cases = [
+            eval_not_case,
+            dummy_fn,
+            dummy_fn,
+            eval_and_case,
+            eval_or_case,
+            eval_implies_case,
+            dummy_fn,
+            eval_always_case,
+            eval_eventually_case,
+            eval_until_case
+        ]
+
+
+        # Use jax.lax.switch to select the appropriate function
+        res = jax.lax.switch(op_index, cases, None)
+
+        # Handle unknown operator case
+        if op_index == -1:
             raise ValueError(f"Unknown operator {ast[0]}")
 
         return res
@@ -549,19 +631,19 @@ class STL:
             self.stlpy_form = ast.get_stlpy_form()
             return self.stlpy_form
 
-        if ast[0] == "~":
+        if ast[0] == self.op_map["~"]:
             self.stlpy_form = self._convert_not(ast)
-        elif ast[0] == "G":
+        elif ast[0] == self.op_map["G"]:
             self.stlpy_form = self._convert_always(ast)
-        elif ast[0] == "F":
+        elif ast[0] == self.op_map["F"]:
             self.stlpy_form = self._convert_eventually(ast)
-        elif ast[0] == "&":
+        elif ast[0] == self.op_map["&"]:
             self.stlpy_form = self._convert_and(ast)
-        elif ast[0] == "|":
+        elif ast[0] == self.op_map["|"]:
             self.stlpy_form = self._convert_or(ast)
-        elif ast[0] == "->":
+        elif ast[0] == self.op_map["->"]:
             self.stlpy_form = self._convert_implies(ast)
-        elif ast[0] == "U":
+        elif ast[0] == self.op_map["U"]:
             self.stlpy_form = self._convert_until(ast)
         else:
             raise ValueError(f"Unknown operator {ast[0]}")
@@ -646,7 +728,7 @@ class STL:
             operator_stack.append(ast)
 
         while operator_stack:
-            cur = operator_stack.pop()
+            cur = self.i_to_op[operator_stack.pop()]
             if self._is_leaf(cur):
                 expr += cur.__str__()
             elif isinstance(cur, str):
