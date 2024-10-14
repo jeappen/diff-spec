@@ -1,14 +1,14 @@
+from collections import deque
+
 import importlib
 import io
+import numpy as np
 import os
 from abc import abstractmethod
-from collections import deque
 from contextlib import redirect_stdout
-from typing import TypeVar
-
-import numpy as np
 from jax.nn import softmax
 from stlpy.STL import LinearPredicate as baseLinearPredicate, STLTree
+from typing import TypeVar, NamedTuple
 
 os.environ["DIFF_STL_BACKEND"] = "jax"  # set the backend to JAX for all child processes
 import ds.utils as ds_utils
@@ -29,10 +29,8 @@ import jax.numpy as jnp
 import re
 
 
-class PredicateBase:
-    def __init__(self, name: str):
-        self.name = name
-        self.logger = logging.getLogger(__name__)
+class PredicateBase(NamedTuple):
+    name: str
 
     def eval_at_t(self, path: jnp.ndarray, t: int = 0) -> jnp.ndarray:
         return self.eval_whole_path(path, t, t + 1)[:, 0]
@@ -57,25 +55,50 @@ class PredicateBase:
         return self.name < other.name
 
 
-class RectReachPredicate(PredicateBase):
+class RectangularPredicate(NamedTuple):
+    """
+        Rectangle reachability predicate
+        """
+
+    cent: np.ndarray
+    size: np.ndarray
+    name: str
+    shrink_factor: float = 1.0  # shrink the rectangle to make it more conservative (for stlpy)
+
+    @property
+    def size_tensor(self):
+        return ds_utils.default_tensor(self.size)
+
+    @property
+    def cent_tensor(self):
+        return ds_utils.default_tensor(self.cent)
+
+    def __hash__(self):
+        return hash((self.cent, self.size))
+
+    def __eq__(self, other):
+        if not isinstance(other, RectReachPredicate):
+            return False
+        # return self.cent == other.cent and self.size == other.size
+        # Above using float difference
+        return np.allclose(self.cent, other.cent) and np.allclose(self.size, other.size)
+
+    def __str__(self) -> str:
+        return self.name
+
+    def __lt__(self, other: "RectangularPredicate") -> bool:
+        """Sort predicates by name."""
+        return self.name < other.name
+
+
+# PREDICATE_FORM = TypeVar("PREDICATE_FORM", RectangularPredicate, PredicateBase)
+PREDICATE_TYPES = (RectangularPredicate, PredicateBase)
+
+
+class RectReachPredicate(RectangularPredicate):
     """
     Rectangle reachability predicate
     """
-
-    def __init__(self, cent: np.ndarray, size: np.ndarray, name: str, shrink_factor: float = 0.5):
-        """
-        :param cent: center of the rectangle
-        :param size: bound of the rectangle
-        :param name: name of the predicate
-        """
-        super().__init__(name)
-        self.cent = cent
-        self.size = size
-
-        self.cent_tensor = ds_utils.default_tensor(cent)
-        self.size_tensor = ds_utils.default_tensor(size)
-        self.shrink_factor = shrink_factor  # shrink the rectangle to make it more conservative
-        self.logger.info(f"shrink factor: {shrink_factor}")
 
     def eval_whole_path(
             self, path: jnp.array, start_t: int = 0, end_t: int = None
@@ -97,23 +120,10 @@ class RectReachPredicate(PredicateBase):
         return inside_npy(bounds, 0, 1, 2, self.name)
 
 
-class RectAvoidPredicate(PredicateBase):
+class RectAvoidPredicate(RectangularPredicate):
     """
     Rectangle avoidance predicate
     """
-
-    def __init__(self, cent: np.ndarray, size: np.ndarray, name: str):
-        """
-        :param cent: center of the rectangle
-        :param size: bound of the rectangle
-        :param name: name of the predicate
-        """
-        super().__init__(name)
-        self.cent = cent
-        self.size = size
-
-        self.cent_tensor = ds_utils.default_tensor(cent)
-        self.size_tensor = ds_utils.default_tensor(size)
 
     def eval_whole_path(
             self, path: jnp.array, start_t: int = 0, end_t: int = None
@@ -592,6 +602,10 @@ class STL:
 
     @staticmethod
     def _is_leaf(ast: AST):
+        # Check is type PREDICATE_FORM
+        for pred_type in PREDICATE_TYPES:
+            if isinstance(ast, pred_type):
+                return True
         return issubclass(type(ast), PredicateBase)
 
     def _tensor_min(self, tensor: jnp.array, axis=-1) -> jnp.array:
@@ -611,10 +625,15 @@ class STL:
         if self.expr_repr is not None:
             return self.expr_repr
 
+        expr = self._extract_repr()
+
+        self.expr_repr = expr
+        return expr
+
+    def _extract_repr(self):
         single_operators = ("~", "G", "F")
         binary_operators = ("&", "|", "->", "U")
         time_bounded_operators = ("G", "F", "U")
-
         # traverse ast
         operator_stack = [self.ast]
         expr = ""
@@ -670,8 +689,6 @@ class STL:
                     push_stack("(")
                 else:
                     push_stack(cur[1])
-
-        self.expr_repr = expr
         return expr
 
     def latex_repr(self):
