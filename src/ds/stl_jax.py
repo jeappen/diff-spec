@@ -74,10 +74,10 @@ class RectangularPredicate(NamedTuple):
         return ds_utils.default_tensor(self.cent)
 
     def __hash__(self):
-        return hash((self.cent, self.size))
+        return hash(f"{self.cent},{self.size}")
 
     def __eq__(self, other):
-        if not isinstance(other, RectReachPredicate):
+        if not isinstance(other, RectangularPredicate):
             return False
         # return self.cent == other.cent and self.size == other.size
         # Above using float difference
