@@ -73,6 +73,21 @@ class RectangularPredicate(NamedTuple):
     def cent_tensor(self):
         return ds_utils.default_tensor(self.cent)
 
+    def eval_at_t(self, path: jnp.ndarray, t: int = 0) -> jnp.ndarray:
+        return self.eval_whole_path(path, t, t + 1)[:, 0]
+
+    @abstractmethod
+    def eval_whole_path(
+            self, path: jnp.ndarray, start_t: int = 0, end_t: int = None
+    ) -> jnp.ndarray:
+        """Stick to JAX when possible."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_stlpy_form(self) -> STLTree:
+        """Use Numpy to ensure compatibility with STLpy."""
+        raise NotImplementedError
+
     def __hash__(self):
         return hash(f"{self.cent},{self.size}")
 
