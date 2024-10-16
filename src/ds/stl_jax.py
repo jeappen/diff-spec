@@ -105,6 +105,10 @@ class RectangularPredicate(NamedTuple):
         """Sort predicates by name."""
         return self.name < other.name
 
+    def __rich_repr__(self):
+        # Assumes that size is common and not important
+        yield f"{self.cent}"
+
 
 # PREDICATE_FORM = TypeVar("PREDICATE_FORM", RectangularPredicate, PredicateBase)
 PREDICATE_TYPES = (RectangularPredicate, PredicateBase)
@@ -645,7 +649,7 @@ class STL:
         self.expr_repr = expr
         return expr
 
-    def _extract_repr(self):
+    def _extract_repr(self, print_rich=False):
         single_operators = ("~", "G", "F")
         binary_operators = ("&", "|", "->", "U")
         time_bounded_operators = ("G", "F", "U")
@@ -663,7 +667,10 @@ class STL:
         while operator_stack:
             cur = operator_stack.pop()
             if self._is_leaf(cur):
-                expr += cur.__str__()
+                if print_rich:
+                    expr += f"({str(next(cur.__rich_repr__()))})"
+                else:
+                    expr += cur.__str__()
             elif isinstance(cur, str):
                 if cur == "(" or cur == ")":
                     expr += cur
