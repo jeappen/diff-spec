@@ -1,9 +1,9 @@
 import importlib
+import jax
+import jax.numpy as jnp
+import numpy as np
 import os
 import unittest
-
-import jax
-import numpy as np
 from jax import jit
 
 os.environ["DIFF_STL_BACKEND"] = "jax"  # So ds_utils does not require torch
@@ -13,6 +13,8 @@ import examples.stl.differentiability as stl_diff_examples
 from ds.stl_jax import STL, RectReachPredicate
 
 from ds.stl import StlpySolver
+
+
 class TestJAXExamples(unittest.TestCase):
 
     def setUp(self):
@@ -41,17 +43,27 @@ class TestJAXExamples(unittest.TestCase):
             # Magic of jax
             res = jit(stl_diff_examples.eval_reach_avoid)()
             final_result.append(res)
+            # Match expected output
+            assert jnp.all((res[0] > 0) == jnp.array([True, False, False]))
+            assert jnp.all((res[1] > 0) == jnp.array([True, False, True]))
 
         print(final_result)
 
         # Test differentiability
-        path = stl_diff_examples.backward()
-        print(path)
+        path, loss = stl_diff_examples.backward()
+        print('Path', path)
+        assert loss < 0  # Loss should be less than 0 to satisfy the formula
         # (jax.lax.fori_loop(0, 1000, lambda i, _: jit(eval_reach_avoid)(), None)).block_until_ready()
         # for _ in range(1000):
         #     eval_reach_avoid()
         #
         # self.assertEqual(True, False)  # add assertion here
+
+    def test_avoid_backward(self):
+
+        path, loss = stl_diff_examples.backward(avoid_spec=True)
+        print('AvoidPath', loss, path)
+        assert loss < 0  # Loss should be less than 0 to satisfy the formula
 
     def test_evaluations(self, num_tiles=3):
         """Run simple evaluations to test shapes and types"""
@@ -108,16 +120,16 @@ class TestJAXExamples(unittest.TestCase):
         """Test the stlpy solver with different forms of STL formulas"""
         x_0 = np.array([0, 0])
         solver = StlpySolver(space_dim=2)
-        total_time = 12 # Common total time for all formulas
+        total_time = 12  # Common total time for all formulas
 
         for form in [self.loop_form, self.cover_form, self.seq_form]:
-
             stlpy_form = form.get_stlpy_form()
             path, info = solver.solve_stlpy_formula(stlpy_form, x0=x_0, total_time=total_time)
 
             num_tiles = 4
             loss = form.eval(jax.numpy.tile(path, (num_tiles, 1, 1)))  # Make a batch of size num_tiles
             self.assertGreater(loss[0], 0, f"STLPY solved path loss is not greater than 0 for {form}")
+
 
 if __name__ == '__main__':
     unittest.main()
