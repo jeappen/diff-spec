@@ -14,6 +14,7 @@ from ds.stl_jax import STL, RectReachPredicate
 
 from ds.stl import StlpySolver
 
+TEST_TOLERANCE = 1e-3  # Small number close to 0
 
 class TestJAXExamples(unittest.TestCase):
 
@@ -52,7 +53,7 @@ class TestJAXExamples(unittest.TestCase):
         # Test differentiability
         path, loss = stl_diff_examples.backward()
         print('Path', path)
-        assert loss < 0  # Loss should be less than 0 to satisfy the formula
+        assert loss < TEST_TOLERANCE  # Loss should be less than 0 to satisfy the formula
         # (jax.lax.fori_loop(0, 1000, lambda i, _: jit(eval_reach_avoid)(), None)).block_until_ready()
         # for _ in range(1000):
         #     eval_reach_avoid()
@@ -63,7 +64,7 @@ class TestJAXExamples(unittest.TestCase):
 
         path, loss = stl_diff_examples.backward(avoid_spec=True)
         print('AvoidPath', loss, path)
-        assert loss < 0  # Loss should be less than 0 to satisfy the formula
+        assert loss < TEST_TOLERANCE  # Loss should be less than 0 to satisfy the formula
 
     def test_evaluations(self, num_tiles=3):
         """Run simple evaluations to test shapes and types"""

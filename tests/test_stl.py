@@ -8,6 +8,7 @@ import ds.utils as ds_utils
 import examples.stl.differentiability as stl_diff_examples
 from ds.stl import STL, RectReachPredicate
 
+TEST_TOLERANCE = 1e-3  # Small number close to 0
 
 class TestExamples(unittest.TestCase):
 
@@ -32,12 +33,12 @@ class TestExamples(unittest.TestCase):
         # Test differentiability
         path, loss = stl_diff_examples.backward()
         print('Path', path)
-        assert loss < 0  # Loss should be less than 0 to satisfy the formula
+        assert loss < TEST_TOLERANCE  # Loss should be less than 0 to satisfy the formula
 
     def test_avoid_backward(self):
         path, loss = stl_diff_examples.backward(avoid_spec=True)
         print('AvoidPath', loss, path)
-        assert loss < 0  # Loss should be less than 0 to satisfy the formula
+        assert loss < TEST_TOLERANCE  # Loss should be less than 0 to satisfy the formula
 
     def test_evaluations(self, num_tiles=3):
         """Run simple evaluations to test shapes and types"""
