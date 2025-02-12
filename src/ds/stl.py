@@ -360,6 +360,10 @@ class PredicateBase:
     def __str__(self) -> str:
         return self.name
 
+    def __lt__(self, other: "PredicateBase") -> bool:
+        """Sort predicates by name."""
+        return self.name < other.name
+
 
 class RectReachPredicate(PredicateBase):
     """
