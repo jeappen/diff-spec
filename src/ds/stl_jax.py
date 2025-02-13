@@ -1,14 +1,14 @@
-from collections import deque
-
 import importlib
 import io
-import numpy as np
 import os
 from abc import abstractmethod
+from collections import deque
 from contextlib import redirect_stdout
+from typing import TypeVar, NamedTuple
+
+import numpy as np
 from jax.nn import softmax
 from stlpy.STL import LinearPredicate as baseLinearPredicate, STLTree
-from typing import TypeVar, NamedTuple
 
 os.environ["DIFF_STL_BACKEND"] = "jax"  # set the backend to JAX for all child processes
 import ds.utils as ds_utils
@@ -26,18 +26,19 @@ inside_npy = ds_utils.inside_rectangle_formula
 
 # Replace with JAX
 import jax.numpy as jnp
+import jax
 import re
 
 
 class PredicateBase(NamedTuple):
     name: str
 
-    def eval_at_t(self, path: jnp.ndarray, t: int = 0) -> jnp.ndarray:
-        return self.eval_whole_path(path, t, t + 1)[:, 0]
+    def eval_at_t(self, path: jnp.ndarray, t: int = 0, train_mode: bool = False) -> jnp.ndarray:
+        return self.eval_whole_path(path, t, t + 1, train_mode=train_mode)[:, 0]
 
     @abstractmethod
     def eval_whole_path(
-            self, path: jnp.ndarray, start_t: int = 0, end_t: int = None
+            self, path: jnp.ndarray, start_t: int = 0, end_t: int = None, train_mode: bool = False
     ) -> jnp.ndarray:
         """Stick to JAX when possible."""
         raise NotImplementedError
@@ -63,7 +64,7 @@ class RectangularPredicate(NamedTuple):
     cent: np.ndarray
     size: np.ndarray
     name: str
-    shrink_factor: float = 1.0  # shrink the rectangle to make it more conservative (for stlpy)
+    shrink_factor: float = 1.0  # shrink (for reach) or expand (for avoid) the rectangle to make it more conservative
 
     @property
     def size_tensor(self):
@@ -73,12 +74,13 @@ class RectangularPredicate(NamedTuple):
     def cent_tensor(self):
         return ds_utils.default_tensor(self.cent)
 
-    def eval_at_t(self, path: jnp.ndarray, t: int = 0) -> jnp.ndarray:
-        return self.eval_whole_path(path, t, t + 1)[:, 0]
+    def eval_at_t(self, path: jnp.ndarray, t: int = 0, train_mode: bool = False) -> jnp.ndarray:
+        return self.eval_whole_path(path, t, t + 1, train_mode=train_mode)[:, 0]
 
     @abstractmethod
     def eval_whole_path(
-            self, path: jnp.ndarray, start_t: int = 0, end_t: int = None
+            self, path: jnp.ndarray, start_t: int = 0, end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.ndarray:
         """Stick to JAX when possible."""
         raise NotImplementedError
@@ -120,14 +122,24 @@ class RectReachPredicate(RectangularPredicate):
     """
 
     def eval_whole_path(
-            self, path: jnp.array, start_t: int = 0, end_t: int = None
+            self, path: jnp.array, start_t: int = 0, end_t: int = None, train_mode: bool = False
     ) -> jnp.array:
         """Stick to JAX when possible."""
         assert len(path.shape) == 3, "motion must be in batch"
         eval_path = path[:, start_t:end_t]
-        res = jnp.min(
-            self.size_tensor / 2 - jnp.abs(eval_path - self.cent_tensor), axis=-1
-        )
+
+        def with_shrink(_eval_path):
+            return jnp.min(
+                # Adding shrink factor to make it more conservative
+                self.size_tensor * self.shrink_factor / 2 - jnp.square(_eval_path - self.cent_tensor), axis=-1
+            )
+
+        def without_shrink(_eval_path):
+            return jnp.min(
+                self.size_tensor / 2 - jnp.abs(_eval_path - self.cent_tensor), axis=-1
+            )
+
+        res = jax.lax.cond(train_mode, with_shrink, without_shrink, eval_path)
 
         return res
 
@@ -145,21 +157,33 @@ class RectAvoidPredicate(RectangularPredicate):
     """
 
     def eval_whole_path(
-            self, path: jnp.array, start_t: int = 0, end_t: int = None
+            self, path: jnp.array, start_t: int = 0, end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
         """Stick to JAX when possible."""
         assert len(path.shape) == 3, "motion must be in batch"
         eval_path = path[:, start_t:end_t]
-        res = jnp.max(
-            jnp.abs(eval_path - self.cent_tensor) - self.size_tensor / 2, axis=-1
-        )
+
+        def with_shrink(_eval_path):
+            return jnp.max(
+                # Adding shrink factor to make it more conservative
+                jnp.square(_eval_path - self.cent_tensor) - self.size_tensor * (1 + self.shrink_factor) / 2, axis=-1
+            )
+
+        def without_shrink(_eval_path):
+            return jnp.max(
+                # Adding shrink factor to make it more conservative
+                jnp.abs(eval_path - self.cent_tensor) - self.size_tensor / 2, axis=-1
+            )
+
+        res = jax.lax.cond(train_mode, with_shrink, without_shrink, eval_path)
 
         return res
 
     def get_stlpy_form(self) -> STLTree:
         """Use Numpy to ensure compatibility with STLpy."""
         bounds = np.stack(
-            [self.cent - self.size / 2, self.cent + self.size / 2]
+            [self.cent - self.size * (1 + self.shrink_factor) / 2, self.cent + self.size / 2]
         ).T.flatten()
         return outside_npy(bounds, 0, 1, 2, self.name)
 
@@ -353,8 +377,14 @@ class STL:
         ast = ["U", self.ast, other.ast, start, end]
         return STL(ast)
 
-    def eval(self, path: jnp.array, t: int = 0) -> jnp.array:
-        return self._eval(self.ast, path, t)
+    def eval(self, path: jnp.array, t: int = 0, train_mode: bool = False) -> jnp.array:
+        """Evaluate the formula at time t.
+
+        :param path:            The motion path to evaluate the formula on.
+        :param train_mode:   Whether to evaluate in training mode (conservative with shrink factor).
+        :param t:               The time step to evaluate the formula at.
+        """
+        return self._eval(self.ast, path, t, train_mode=train_mode)
 
     def end_time(self) -> int:
         """Get the end time of the formula efficiently."""
@@ -378,32 +408,36 @@ class STL:
         return max(self._get_end_time(ast[1]), self._get_end_time(ast[2]))
 
     def _eval(
-            self, ast: AST, path: jnp.array, start_t: int = 0, end_t: int = None
+            self,
+            ast: AST,
+            path: jnp.array,
+            start_t: int = 0,
+            end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
         if self._is_leaf(ast):
-            return ast.eval_at_t(path, start_t)
+            return ast.eval_at_t(path, start_t, train_mode=train_mode)
 
         if ast[0] in self.sequence_operators:
             # NOTE: Overwrite start_t and end_t
-            # this will allow access the elements after previous end_t
             start_t, end_t = start_t + ast[-2], start_t + ast[-1]
             if end_t > path.shape[1]:
                 self.logger.warning("end_t is larger than motion length")
 
         if ast[0] == "&":
-            res = self._eval_and(ast[1], ast[2], path, start_t, end_t)
+            res = self._eval_and(ast[1], ast[2], path, start_t, end_t, train_mode=train_mode)
         elif ast[0] == "|":
-            res = self._eval_or(ast[1], ast[2], path, start_t, end_t)
+            res = self._eval_or(ast[1], ast[2], path, start_t, end_t, train_mode=train_mode)
         elif ast[0] == "~":
-            res = self._eval_not(ast[1], path, start_t, end_t)
+            res = self._eval_not(ast[1], path, start_t, end_t, train_mode=train_mode)
         elif ast[0] == "->":
-            res = self._eval_implies(ast[1], ast[2], path, start_t, end_t)
+            res = self._eval_implies(ast[1], ast[2], path, start_t, end_t, train_mode=train_mode)
         elif ast[0] == "G":
-            res = self._eval_always(ast[1], path, start_t, end_t)
+            res = self._eval_always(ast[1], path, start_t, end_t, train_mode=train_mode)
         elif ast[0] == "F":
-            res = self._eval_eventually(ast[1], path, start_t, end_t)
+            res = self._eval_eventually(ast[1], path, start_t, end_t, train_mode=train_mode)
         elif ast[0] == "U":
-            res = self._eval_until(ast[1], ast[2], path, start_t, end_t)
+            res = self._eval_until(ast[1], ast[2], path, start_t, end_t, train_mode=train_mode)
         else:
             raise ValueError(f"Unknown operator {ast[0]}")
 
@@ -416,12 +450,13 @@ class STL:
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
         return self._tensor_min(
             jnp.stack(
                 [
-                    self._eval(sub_form1, path, start_t, end_t),
-                    self._eval(sub_form2, path, start_t, end_t),
+                    self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode),
+                    self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode),
                 ],
                 axis=-1,
             ),
@@ -435,20 +470,28 @@ class STL:
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
         return self._tensor_max(
             jnp.stack(
                 [
-                    self._eval(sub_form1, path, start_t, end_t),
-                    self._eval(sub_form2, path, start_t, end_t),
+                    self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode),
+                    self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode),
                 ],
                 axis=-1,
             ),
             axis=-1,
         )
 
-    def _eval_not(self, ast: AST, path: jnp.array, start_t: int, end_t: int) -> jnp.array:
-        return -self._eval(ast, path, start_t, end_t)
+    def _eval_not(
+            self,
+            ast: AST,
+            path: jnp.array,
+            start_t: int,
+            end_t: int,
+            train_mode: bool = False
+    ) -> jnp.array:
+        return -self._eval(ast, path, start_t, end_t, train_mode=train_mode)
 
     def _eval_implies(
             self,
@@ -457,25 +500,35 @@ class STL:
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
         if IMPLIES_TRICK:
-            return self._eval(sub_form1, path, start_t, end_t) * self._eval(
-                sub_form2, path, start_t, end_t
+            return (
+                    self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode)
+                    * self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode)
             )
-        return self._eval_or(["~", sub_form1], sub_form2, path, start_t, end_t)
+        return self._eval_or(
+            ["~", sub_form1], sub_form2, path, start_t, end_t, train_mode=train_mode
+        )
 
     def _eval_always(
-            self, sub_form: AST, path: jnp.array, start_t: int, end_t: int
+            self,
+            sub_form: AST,
+            path: jnp.array,
+            start_t: int,
+            end_t: int,
+            train_mode: bool = False
     ) -> jnp.array:
         if self._is_leaf(sub_form):
             return self._tensor_min(
-                sub_form.eval_whole_path(path[:, start_t:end_t]), axis=-1
+                sub_form.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode),
+                axis=-1
             )
 
         # unroll always
         val_per_time = jnp.stack(
             [
-                self._eval(sub_form, path, start_t=start_t + t, end_t=end_t)
+                self._eval(sub_form, path, start_t=start_t + t, end_t=end_t, train_mode=train_mode)
                 for t in range(end_t - start_t)
             ],
             axis=-1,
@@ -484,17 +537,23 @@ class STL:
         return self._tensor_min(val_per_time, axis=-1)
 
     def _eval_eventually(
-            self, sub_form: AST, path: jnp.array, start_t: int = 0, end_t: int = None
+            self,
+            sub_form: AST,
+            path: jnp.array,
+            start_t: int = 0,
+            end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
         if self._is_leaf(sub_form):
             return self._tensor_max(
-                sub_form.eval_whole_path(path[:, start_t:end_t]), axis=-1
+                sub_form.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode),
+                axis=-1
             )
 
         # unroll eventually
         val_per_time = jnp.stack(
             [
-                self._eval(sub_form, path, start_t=start_t + t, end_t=end_t)
+                self._eval(sub_form, path, start_t=start_t + t, end_t=end_t, train_mode=train_mode)
                 for t in range(end_t - start_t)
             ],
             axis=-1,
@@ -509,49 +568,43 @@ class STL:
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
         if self._is_leaf(sub_form2):
-            till_pred = sub_form2.eval_whole_path(path[:, start_t:end_t])
+            till_pred = sub_form2.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode)
         else:
             till_pred = jnp.stack(
                 [
-                    self._eval(sub_form2, path, start_t=t, end_t=end_t)
+                    self._eval(sub_form2, path, start_t=t, end_t=end_t, train_mode=train_mode)
                     for t in range(end_t - start_t)
                 ],
                 axis=-1,
             )
-        # mask condition, once condition > 0 (after until True),
-        # the right sequence is no longer considered
+
+        # mask condition...
         cond = (till_pred > 0).astype(int)
         index = jnp.argmax(cond, axis=-1)
-
         batch_size, seq_len = cond.shape
         row_indices = jnp.arange(batch_size)[:, None]
         col_indices = jnp.arange(seq_len)
-
         mask = col_indices >= index[:, None]
+        cond = ~mask.astype(bool)
 
-        # Apply the mask
-        cond = mask.astype(int)
-        cond = ~cond.astype(bool)
-
-        # for i in range(cond.shape[0]):
-        #     cond[i, index[i]:] = 1.0
-        # cond = ~cond.astype(bool)
+        # Set true values after 'till' is satisfied
         till_pred = jnp.where(cond, till_pred, ds_utils.default_tensor(1))
 
         if self._is_leaf(sub_form1):
-            res = sub_form1.eval_whole_path(path[:, start_t:end_t])
+            res = sub_form1.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode)
         else:
             res = jnp.stack(
                 [
-                    self._eval(sub_form1, path, start_t=t, end_t=end_t)
+                    self._eval(sub_form1, path, start_t=t, end_t=end_t, train_mode=train_mode)
                     for t in range(end_t - start_t)
                 ],
                 axis=-1,
             )
-        res = jnp.where(cond, res, ds_utils.default_tensor(-1))
 
+        res = jnp.where(cond, res, ds_utils.default_tensor(-1))
         # when cond < 0, res should always > 0 to be hold
         return self._tensor_min(-res * till_pred, axis=-1)
 

@@ -1,9 +1,10 @@
 # %%
 import importlib
+import os
+
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
-import os
 
 import ds.utils as ds_utils
 
@@ -164,10 +165,13 @@ def backward(avoid_spec=False, mute=True):
         solver = optax.adam(lr)
         var_solver_state = solver.init(path)
 
+        stl_form_eval_train = lambda x: -form.eval(x, train_mode=True).mean()
+        stl_form_eval_test = lambda x: -form.eval(x).mean()
+
         @jax.jit
         def train_step(params, solver_state):
             # Performs a one step update.
-            (loss), grad = jax.value_and_grad(lambda x: -form.eval(x).mean())(
+            (loss), grad = jax.value_and_grad(stl_form_eval_train)(
                 params
             )
             updates, solver_state = solver.update(grad, solver_state)
@@ -179,7 +183,7 @@ def backward(avoid_spec=False, mute=True):
                 path, var_solver_state
             )
 
-        loss = train_loss
+        loss = stl_form_eval_test(path)
     else:
         # PyTorch backend (slower when num_iterations is high)
         path.requires_grad = True
