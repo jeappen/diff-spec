@@ -28,6 +28,7 @@ inside_npy = ds_utils.inside_rectangle_formula
 import jax.numpy as jnp
 import jax
 import re
+import jax.tree_util as jtu
 
 
 class PredicateBase(NamedTuple):
@@ -131,7 +132,7 @@ class RectReachPredicate(RectangularPredicate):
         def with_shrink(_eval_path):
             return jnp.min(
                 # Adding shrink factor to make it more conservative
-                self.size_tensor * self.shrink_factor / 2 - jnp.square(_eval_path - self.cent_tensor), axis=-1
+                (self.size_tensor * 0.8 / 2) ** 2 - jnp.square(_eval_path - self.cent_tensor), axis=-1
             )
 
         def without_shrink(_eval_path):
@@ -167,7 +168,8 @@ class RectAvoidPredicate(RectangularPredicate):
         def with_shrink(_eval_path):
             return jnp.max(
                 # Adding shrink factor to make it more conservative
-                jnp.square(_eval_path - self.cent_tensor) - self.size_tensor * (1 + self.shrink_factor) / 2, axis=-1
+                jnp.square(_eval_path - self.cent_tensor) - (self.size_tensor * (1 + self.shrink_factor) / 2) ** 2,
+                axis=-1
             )
 
         def without_shrink(_eval_path):
@@ -404,6 +406,8 @@ class STL:
         if ast[0] in self.sequence_operators:
             # The last two elements are the start and end times
             return ast[-1]
+        if ast[0] == "~":
+            return self._get_end_time(ast[1])
         # Is binary operator
         return max(self._get_end_time(ast[1]), self._get_end_time(ast[2]))
 
@@ -805,3 +809,27 @@ class STL:
                 raise RuntimeError("Should never visit here")
 
         return all_preds
+
+
+# Register for use with JAX
+
+# Register PredicateBase as a PyTree
+jtu.register_pytree_node(
+    PredicateBase,
+    lambda pred: ((), (pred.name,)),  # Flatten: no JAX-tracked fields, only auxiliary data
+    lambda aux, _: PredicateBase(aux[0])  # Unflatten
+)
+
+# Register RectangularPredicate as a PyTree
+jtu.register_pytree_node(
+    RectangularPredicate,
+    lambda pred: ((pred.cent, pred.size), (pred.name, pred.shrink_factor)),  # Flatten
+    lambda aux, children: RectangularPredicate(children[0], children[1], aux[0], aux[1])  # Unflatten
+)
+
+# Register STL as a PyTree
+jtu.register_pytree_node(
+    STL,
+    lambda stl: ((stl.ast,), ()),  # Flatten: AST (JAX-tracked), no auxiliary data
+    lambda aux, children: STL(children[0])  # Unflatten
+)
