@@ -36,7 +36,12 @@ class TestMASTLJAXExamples(unittest.TestCase):
 
         self.num_satisfied_agents = 2
         task = Task("task", self.form, self.num_satisfied_agents, None)
+        task_seq = Task("task_seq", self.seq_form, self.num_satisfied_agents, None)
+        task_cover = Task("task_cover", self.cover_form, self.num_satisfied_agents, None)
+        task_loop = Task("task_loop", self.loop_form, self.num_satisfied_agents, None)
         self.catl_form = CaTLPlus(task)
+        self.catl_form_or = CaTLPlus(task) | CaTLPlus(task_seq)
+        self.catl_form_and = CaTLPlus(task_cover) & CaTLPlus(task_seq)
 
     def test_evaluations(self, num_tiles=3):
         """Run simple evaluations to test shapes and types"""
@@ -86,12 +91,66 @@ class TestMASTLJAXExamples(unittest.TestCase):
             )
         )
 
+        path_sat_seq = ds_utils.default_tensor(
+            np.array(
+                [
+                    [
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [2, 2],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                    ],
+                ]
+            )
+        )
+
+        path_sat_cover = ds_utils.default_tensor(
+            np.array(
+                [
+                    [
+                        [0, 0],
+                        [0, 0],
+                        [2, 2],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [0, 0],
+                    ],
+                ]
+            )
+        )
+
         input_path = jax.numpy.tile(path, (num_tiles, 1, 1))
 
         loss = self.form.eval(input_path)  # Make a batch of size num_tiles
 
         not_satisfy_catl_path = jnp.concatenate([input_path, path_sat], axis=0)
         satisfy_catl_path = jnp.concatenate([input_path, path_sat, path_sat], axis=0)
+        satisfy_catl_path_seq = jnp.concatenate([input_path, path_sat_seq, path_sat_seq], axis=0)
+        satisfy_catl_path_seq_and = jnp.concatenate(
+            [input_path, path_sat_cover, path_sat_cover, path_sat_seq, path_sat_seq],
+            axis=0)
+        notsatisfy_catl_path_seq_and = jnp.concatenate(
+            [input_path, path_sat_cover, path_sat_cover, path_sat_cover, path_sat_seq],
+            axis=0)
+        not_satisfy_catl_path_seq = jnp.concatenate([input_path, path_sat_seq, input_path], axis=0)
 
         loss = self.catl_form.eval(not_satisfy_catl_path)
 
@@ -102,6 +161,22 @@ class TestMASTLJAXExamples(unittest.TestCase):
         # self.assertGreater(len(loss.shape), 0, f"Not returning correct shape")
         self.assertGreater(loss, 0, f"Not returning correct value")
         # self.assertEqual(loss.shape[0], num_tiles, f"Not returning {num_tiles} values")
+
+        # Now test the or and and operators
+        loss = self.catl_form_or.eval(satisfy_catl_path)
+        self.assertGreater(loss, 0, f"Not returning correct value for or sat path")
+        loss = self.catl_form_or.eval(satisfy_catl_path_seq)
+        self.assertGreater(loss, 0, f"Not returning correct value for or sat path")
+
+        loss = self.catl_form_or.eval(not_satisfy_catl_path)
+        self.assertLess(loss, 0, f"Not returning correct value for or unsat path")
+        loss = self.catl_form_or.eval(not_satisfy_catl_path_seq)
+        self.assertLess(loss, 0, f"Not returning correct value for or unsat path")
+
+        loss = self.catl_form_and.eval(notsatisfy_catl_path_seq_and)
+        self.assertLess(loss, 0, f"Not returning correct value for and unsat path")
+        loss = self.catl_form_and.eval(satisfy_catl_path_seq_and)
+        self.assertGreater(loss, 0, f"Not returning correct value for and sat path")
 
     def test_repr(self):
         print(self.form)

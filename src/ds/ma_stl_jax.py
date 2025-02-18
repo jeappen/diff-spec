@@ -221,16 +221,15 @@ class CaTLPlus:
             end_t: int = None,
             train_mode: bool = False
     ) -> jnp.array:
-        return self._tensor_min(
-            jnp.stack(
-                [
-                    self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode),
-                    self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode),
-                ],
-                axis=-1,
-            ),
+        stacked = jnp.stack(
+            [
+                self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode),
+                self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode),
+            ],
             axis=-1,
         )
+        res = self._tensor_min(stacked, axis=-1)
+        return res
 
     def _eval_or(
             self,
@@ -241,16 +240,15 @@ class CaTLPlus:
             end_t: int = None,
             train_mode: bool = False
     ) -> jnp.array:
-        return self._tensor_max(
-            jnp.stack(
-                [
-                    self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode),
-                    self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode),
-                ],
-                axis=-1,
-            ),
+        stacked = jnp.stack(
+            [
+                self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode),
+                self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode),
+            ],
             axis=-1,
         )
+        res = self._tensor_max(stacked, axis=-1)
+        return res
 
     def _eval_not(
             self,
