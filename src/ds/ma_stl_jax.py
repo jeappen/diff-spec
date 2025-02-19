@@ -1,5 +1,7 @@
 from typing import Optional
 
+import jax.lax
+
 from .stl_jax import *
 
 """Multi agent STL specifications"""
@@ -42,6 +44,7 @@ class Task(TaskBase):
             self, path: jnp.ndarray, start_t: int = 0, end_t: int = None, train_mode: bool = False
     ) -> jnp.ndarray:
         # NOTE: Does not support end_t
+        # TODO: If train_mode, return the exponential robustness
         # return self.spec.eval(path, start_t, train_mode) > 0
         topk_val, topk_ind = jax.lax.top_k(self.spec.eval(path, start_t, train_mode=train_mode),
                                            self.num_satisfied_agents)
@@ -70,9 +73,12 @@ TASK_TYPES = (Task, TaskBase)
 
 cAST = TypeVar("AST", list, TaskBase)
 
+EXP_ROBUSTNESS_BETA = .5
+
 
 class CaTLPlus:
-    """Outerlogic for CaTL+. Takes the whole system of agents NxMxT and returns the satisfaction of the formula."""
+    """Outerlogic for CaTL+. Takes the whole system of agents NxMxT and returns the satisfaction of the formula.
+    Allows exponential robustness evaluation as in CaTL+ using the train_mode flag."""
 
     def __init__(self, cast: cAST):
         self.cast = cast
@@ -126,10 +132,10 @@ class CaTLPlus:
         return jax.vmap(self.eval, in_axes=0)(path, t, train_mode)
 
     def eval(self, path: jnp.array, t: int = 0, train_mode: bool = False) -> jnp.array:
-        """Evaluate the formula at time t.
+        """Evaluate the formula at time t. Training mode is for exponential robustness as in CaTL+.
 
         :param path:            The motion path to evaluate the formula on (Num_agents x Traj_len x Dim)
-        :param train_mode:   Whether to evaluate in training mode (conservative with shrink factor).
+        :param train_mode:      Whether to evaluate in training mode (exponential robustness).
         :param t:               The time step to evaluate the formula at.
         """
         return self._eval(self.cast, path, t, train_mode=train_mode)
@@ -212,6 +218,28 @@ class CaTLPlus:
 
         return res
 
+    def _flatten_and_or(self, cast: cAST, flat_and=True) -> list[cAST]:
+        """
+        Recursively collect every subformula under an & chain into a single list.
+        For example, if cast = ['&', A, ['&', B, C]], then
+        _flatten_and(cast) = [A, B, C].
+        """
+        # If it's not an AND node, just return it as a single-element list.
+        stack = [cast]
+        result = []
+        flat_char = "&" if flat_and else "|"
+        while stack:
+            node = stack.pop()
+            if isinstance(node, list) and node[0] == flat_char:
+                # node is of the form: ['&', left, right]
+                # push its children on the stack
+                stack.append(node[2])
+                stack.append(node[1])
+            else:
+                # leaf node (predicate) or non-& operator
+                result.append(node)
+        return result
+
     def _eval_and(
             self,
             sub_form1: cAST,
@@ -221,15 +249,68 @@ class CaTLPlus:
             end_t: int = None,
             train_mode: bool = False
     ) -> jnp.array:
-        stacked = jnp.stack(
-            [
-                self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode),
-                self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode),
-            ],
-            axis=-1,
-        )
-        res = self._tensor_min(stacked, axis=-1)
-        return res
+        # TODO: If train_mode use exponential robustness
+        def regular_and(_sub_form1, _sub_form2, _path, _start_t, _end_t):
+            _train_mode = False
+            subforms = self._flatten_and_or(["&", _sub_form1, _sub_form2], flat_and=True)
+
+            # 2. Evaluate each subformula
+            vals = [
+                self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode)
+                for subf in subforms
+            ]
+
+            # 3. Stack and do a single min (or your exponential scheme)
+            stacked = jnp.stack(vals, axis=-1)
+            return self._tensor_min(stacked, axis=-1)
+
+        def exponential_and(_sub_form1, _sub_form2, _path, _start_t, _end_t):
+            _train_mode = True
+            subforms = self._flatten_and_or(["&", _sub_form1, _sub_form2], flat_and=True)
+
+            # TODO: Finish this
+            # 2. Evaluate each subformula
+            vals = [
+                self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode)
+                for subf in subforms
+            ]
+            stacked = jnp.stack(vals, axis=-1)
+            min_val = jnp.min(stacked, axis=-1)
+
+            # If min is negative, return min * exp(val-min / min)
+            # If min is positive, return min * (2 - exp (min-val / min))
+            # If min is zero, return min
+            # Compute an index based on the sign of min_val:
+            #   0 -> negative, 1 -> positive, 2 -> zero.
+            min_val_vector = jnp.ones_like(stacked) * min_val
+            branch_index = jnp.where(min_val < 0,
+                                     0,
+                                     jnp.where(min_val > 0, 1, 2))
+
+            def negative(_stacked_vals):
+                # When min is negative
+                return min_val * jnp.exp((_stacked_vals - min_val) / min_val)
+
+            def positive(_stacked_vals):
+                # When min is positive; note the rearrangement for the given formula.
+                return min_val * (2 - jnp.exp((min_val - _stacked_vals) / min_val))
+
+            def zero(_stacked_vals):
+                # When min is zero, simply return min_val (which is zero)
+                return min_val_vector
+
+            # List of branch functions. Each branch must have the same output type.
+            branches = [negative, positive, zero]
+
+            # Use jax.lax.switch to select and run the correct branch.
+            res = jax.lax.switch(branch_index, branches, stacked)
+
+            return res.mean() * (1 - EXP_ROBUSTNESS_BETA) + min_val * EXP_ROBUSTNESS_BETA
+
+        if train_mode:
+            return exponential_and(sub_form1, sub_form2, path, start_t, end_t)
+        else:
+            return regular_and(sub_form1, sub_form2, path, start_t, end_t)
 
     def _eval_or(
             self,
@@ -240,15 +321,20 @@ class CaTLPlus:
             end_t: int = None,
             train_mode: bool = False
     ) -> jnp.array:
-        stacked = jnp.stack(
-            [
-                self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode),
-                self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode),
-            ],
-            axis=-1,
-        )
-        res = self._tensor_max(stacked, axis=-1)
-        return res
+        def regular_or(_sub_form1, _sub_form2, _path, _start_t, _end_t, _train_mode):
+            subforms = self._flatten_and_or(["|", _sub_form1, _sub_form2], flat_and=False)
+
+            # 2. Evaluate each subformula
+            vals = [
+                self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode)
+                for subf in subforms
+            ]
+
+            # 3. Stack and do a single min (or your exponential scheme)
+            stacked = jnp.stack(vals, axis=-1)
+            return self._tensor_max(stacked, axis=-1)
+
+        return regular_or(sub_form1, sub_form2, path, start_t, end_t, train_mode)
 
     def _eval_not(
             self,
