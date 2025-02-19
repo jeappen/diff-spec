@@ -447,6 +447,28 @@ class STL:
 
         return res
 
+    def _flatten_and_or(self, cast: AST, flat_and=True) -> list[AST]:
+        """
+        Recursively collect every subformula under an & chain into a single list.
+        For example, if cast = ['&', A, ['&', B, C]], then
+        _flatten_and(cast) = [A, B, C].
+        """
+        # If it's not an AND node, just return it as a single-element list.
+        stack = [cast]
+        result = []
+        flat_char = "&" if flat_and else "|"
+        while stack:
+            node = stack.pop()
+            if isinstance(node, list) and node[0] == flat_char:
+                # node is of the form: ['&', left, right]
+                # push its children on the stack
+                stack.append(node[2])
+                stack.append(node[1])
+            else:
+                # leaf node (predicate) or non-& operator
+                result.append(node)
+        return result
+
     def _eval_and(
             self,
             sub_form1: AST,
@@ -456,16 +478,21 @@ class STL:
             end_t: int = None,
             train_mode: bool = False
     ) -> jnp.array:
-        return self._tensor_min(
-            jnp.stack(
-                [
-                    self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode),
-                    self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode),
-                ],
-                axis=-1,
-            ),
-            axis=-1,
-        )
+        def regular_and(_sub_form1, _sub_form2, _path, _start_t, _end_t):
+            _train_mode = False
+            subforms = self._flatten_and_or(["&", _sub_form1, _sub_form2], flat_and=True)
+
+            # 2. Evaluate each subformula
+            vals = [
+                self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode)
+                for subf in subforms
+            ]
+
+            # 3. Stack and do a single min (or your exponential scheme)
+            stacked = jnp.stack(vals, axis=-1)
+            return self._tensor_min(stacked, axis=-1)
+
+        return regular_and(sub_form1, sub_form2, path, start_t, end_t)
 
     def _eval_or(
             self,
@@ -476,16 +503,20 @@ class STL:
             end_t: int = None,
             train_mode: bool = False
     ) -> jnp.array:
-        return self._tensor_max(
-            jnp.stack(
-                [
-                    self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode),
-                    self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode),
-                ],
-                axis=-1,
-            ),
-            axis=-1,
-        )
+        def regular_or(_sub_form1, _sub_form2, _path, _start_t, _end_t, _train_mode):
+            subforms = self._flatten_and_or(["|", _sub_form1, _sub_form2], flat_and=False)
+
+            # 2. Evaluate each subformula
+            vals = [
+                self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode)
+                for subf in subforms
+            ]
+
+            # 3. Stack and do a single min (or your exponential scheme)
+            stacked = jnp.stack(vals, axis=-1)
+            return self._tensor_max(stacked, axis=-1)
+
+        return regular_or(sub_form1, sub_form2, path, start_t, end_t, train_mode)
 
     def _eval_not(
             self,
