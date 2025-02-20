@@ -103,7 +103,7 @@ def eval_reach_avoid(mute=False):
     return res1, res2
 
 
-def backward(avoid_spec=False, mute=True):
+def backward(jax_key=None, avoid_spec=False, mute=True):
     """
     Planning with gradient descent
     """
@@ -153,14 +153,17 @@ def backward(avoid_spec=False, mute=True):
         ]
     )
 
-    random_like = np.random.rand(*np_path.shape)
-
-    path = ds_utils.default_tensor(random_like)
     loss = None
     lr = 0.1
     num_iterations = 1000
 
     if os.environ.get("DIFF_STL_BACKEND") == "jax":
+
+        if jax_key is None:
+            jax_key = jax.random.PRNGKey(0)
+
+        random_like = jax.random.normal(jax_key, np_path.shape)
+        path = ds_utils.default_tensor(random_like)
 
         solver = optax.adam(lr)
         var_solver_state = solver.init(path)
@@ -185,6 +188,9 @@ def backward(avoid_spec=False, mute=True):
 
         loss = stl_form_eval_test(path)
     else:
+
+        random_like = np.random.rand(*np_path.shape)
+        path = ds_utils.default_tensor(random_like)
         # PyTorch backend (slower when num_iterations is high)
         path.requires_grad = True
         opt = Adam(params=[path], lr=lr)

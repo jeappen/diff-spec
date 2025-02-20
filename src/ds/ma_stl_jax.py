@@ -249,7 +249,6 @@ class CaTLPlus:
             end_t: int = None,
             train_mode: bool = False
     ) -> jnp.array:
-        # TODO: If train_mode use exponential robustness
         def regular_and(_sub_form1, _sub_form2, _path, _start_t, _end_t):
             _train_mode = False
             subforms = self._flatten_and_or(["&", _sub_form1, _sub_form2], flat_and=True)
@@ -268,7 +267,6 @@ class CaTLPlus:
             _train_mode = True
             subforms = self._flatten_and_or(["&", _sub_form1, _sub_form2], flat_and=True)
 
-            # TODO: Finish this
             # 2. Evaluate each subformula
             vals = [
                 self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode)
@@ -282,28 +280,28 @@ class CaTLPlus:
             # If min is zero, return min
             # Compute an index based on the sign of min_val:
             #   0 -> negative, 1 -> positive, 2 -> zero.
-            min_val_vector = jnp.ones_like(stacked) * min_val
+
             branch_index = jnp.where(min_val < 0,
                                      0,
                                      jnp.where(min_val > 0, 1, 2))
 
-            def negative(_stacked_vals):
+            def negative(_stacked_vals, _min_val):
                 # When min is negative
-                return min_val * jnp.exp((_stacked_vals - min_val) / min_val)
+                return _min_val * jnp.exp((_stacked_vals - _min_val) / _min_val)
 
-            def positive(_stacked_vals):
+            def positive(_stacked_vals, _min_val):
                 # When min is positive; note the rearrangement for the given formula.
-                return min_val * (2 - jnp.exp((min_val - _stacked_vals) / min_val))
+                return _min_val * (2 - jnp.exp((_min_val - _stacked_vals) / _min_val))
 
-            def zero(_stacked_vals):
-                # When min is zero, simply return min_val (which is zero)
-                return min_val_vector
+            def zero(_stacked_vals, _min_val):
+                # When min is zero, simply return _min_val (which is zero)
+                return jnp.ones_like(stacked) * _min_val
 
             # List of branch functions. Each branch must have the same output type.
             branches = [negative, positive, zero]
 
             # Use jax.lax.switch to select and run the correct branch.
-            res = jax.lax.switch(branch_index, branches, stacked)
+            res = jax.lax.switch(branch_index, branches, stacked, min_val)
 
             return res.mean() * (1 - EXP_ROBUSTNESS_BETA) + min_val * EXP_ROBUSTNESS_BETA
 

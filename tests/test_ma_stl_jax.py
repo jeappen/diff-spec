@@ -167,55 +167,48 @@ class TestMASTLJAXExamples(unittest.TestCase):
 
         loss = self.form.eval(input_path)  # Make a batch of size num_tiles
 
-        not_satisfy_catl_path = jnp.concatenate([input_path, path_sat], axis=0)
-        satisfy_catl_path = jnp.concatenate([input_path, path_sat, path_sat], axis=0)
-        satisfy_catl_path_seq = jnp.concatenate([input_path, path_sat_seq, path_sat_seq], axis=0)
-        satisfy_catl_path_seq_and = jnp.concatenate(
-            [input_path, path_sat_cover, path_sat_cover, path_sat_seq, path_sat_seq], axis=0)
-        satisfy_catl_path_seq_3and = jnp.concatenate(
-            [input_path, path_sat_cover, path_sat_seq, path_sat_seq, path_sat_seq_inv,
-             path_sat_seq_inv], axis=0)
-        notsatisfy_catl_path_seq_and = jnp.concatenate(
-            [input_path, path_sat_cover, path_sat_cover, path_sat_cover, path_sat_seq], axis=0)
-        notsatisfy_catl_path_seq_3and = jnp.concatenate(
-            [input_path, path_sat_seq, path_sat_seq, path_sat_seq_inv], axis=0)
-        not_satisfy_catl_path_seq = jnp.concatenate([input_path, path_sat_seq, input_path], axis=0)
+        paths = {
+            "not_satisfy": (jnp.concatenate([input_path, path_sat], axis=0), -1),
+            "satisfy": (jnp.concatenate([input_path, path_sat, path_sat], axis=0), +1),
+            "satisfy_seq": (jnp.concatenate([input_path, path_sat_seq, path_sat_seq], axis=0), +1),
+            "satisfy_seq_and": (jnp.concatenate([input_path, path_sat_cover, path_sat_cover,
+                                                 path_sat_seq, path_sat_seq], axis=0), +1),
+            "satisfy_seq_3and": (jnp.concatenate([input_path, path_sat_cover, path_sat_seq, path_sat_seq,
+                                                  path_sat_seq_inv, path_sat_seq_inv], axis=0), +1),
+            "notsatisfy_seq_and": (jnp.concatenate([input_path, path_sat_cover, path_sat_cover, path_sat_cover,
+                                                    path_sat_seq], axis=0), -1),
+            "notsatisfy_seq_3and": (jnp.concatenate([input_path, path_sat_seq, path_sat_seq,
+                                                     path_sat_seq_inv], axis=0), -1),
+            "not_satisfy_seq": (jnp.concatenate([input_path, path_sat_seq, input_path], axis=0), -1),
+        }
 
-        loss = self.catl_form.eval(not_satisfy_catl_path)
+        # Define the test cases: each is a tuple with the form to use, the key from paths, and a custom message.
+        test_cases = [
+            (self.catl_form, "not_satisfy", "Not returning correct value"),
+            (self.catl_form, "satisfy", "Not returning correct value"),
+            (self.catl_form_or, "satisfy", "Not returning correct value for or sat path"),
+            (self.catl_form_or, "satisfy_seq", "Not returning correct value for or sat path"),
+            (self.catl_form_or, "not_satisfy", "Not returning correct value for or unsat path"),
+            (self.catl_form_or, "not_satisfy_seq", "Not returning correct value for or unsat path"),
+            (self.catl_form_and, "notsatisfy_seq_and", "Not returning correct value for and unsat path"),
+            (self.catl_form_and, "satisfy_seq_and", "Not returning correct value for and sat path"),
+            (self.catl_form_3and, "notsatisfy_seq_3and", "Not returning correct value for 3and unsat path"),
+            (self.catl_form_3and, "satisfy_seq_3and", "Not returning correct value for 3and sat path"),
+        ]
 
-        # self.assertGreater(len(loss.shape), 0, f"Not returning correct shape")
-        self.assertLess(loss, 0, f"Not returning correct value")
+        # Helper function to evaluate and assert based on expected outcome.
+        def check_eval(form, path_key, train_mode):
+            path_data, expected_sign = paths[path_key]
+            loss = form.eval(path_data, train_mode=train_mode)
+            if expected_sign > 0:
+                self.assertGreater(loss, 0, f"{path_key} failed in train_mode={train_mode}")
+            else:
+                self.assertLess(loss, 0, f"{path_key} failed in train_mode={train_mode}")
 
-        loss = self.catl_form.eval(satisfy_catl_path)
-        # self.assertGreater(len(loss.shape), 0, f"Not returning correct shape")
-        self.assertGreater(loss, 0, f"Not returning correct value")
-
-        # self.assertEqual(loss.shape[0], num_tiles, f"Not returning {num_tiles} values")
-
-        def eval_cat_or_and(train_mode=False):
-            # Now test the or and and operators
-            loss = self.catl_form_or.eval(satisfy_catl_path, train_mode=train_mode)
-            self.assertGreater(loss, 0, f"Not returning correct value for or sat path")
-            loss = self.catl_form_or.eval(satisfy_catl_path_seq, train_mode=train_mode)
-            self.assertGreater(loss, 0, f"Not returning correct value for or sat path")
-
-            loss = self.catl_form_or.eval(not_satisfy_catl_path, train_mode=train_mode)
-            self.assertLess(loss, 0, f"Not returning correct value for or unsat path")
-            loss = self.catl_form_or.eval(not_satisfy_catl_path_seq, train_mode=train_mode)
-            self.assertLess(loss, 0, f"Not returning correct value for or unsat path")
-
-            loss = self.catl_form_and.eval(notsatisfy_catl_path_seq_and, train_mode=train_mode)
-            self.assertLess(loss, 0, f"Not returning correct value for and unsat path")
-            loss = self.catl_form_and.eval(satisfy_catl_path_seq_and, train_mode=train_mode)
-            self.assertGreater(loss, 0, f"Not returning correct value for and sat path")
-
-            loss = self.catl_form_3and.eval(notsatisfy_catl_path_seq_3and, train_mode=train_mode)
-            self.assertLess(loss, 0, f"Not returning correct value for 3and unsat path")
-            loss = self.catl_form_3and.eval(satisfy_catl_path_seq_3and, train_mode=train_mode)
-            self.assertGreater(loss, 0, f"Not returning correct value for 3and sat path")
-
-        eval_cat_or_and(train_mode=False)
-        eval_cat_or_and(train_mode=True)
+        # Iterate over test cases for both training modes
+        for train_mode in [False, True]:
+            for form, path_key, message in test_cases:
+                check_eval(form, path_key, train_mode)
 
     def test_repr(self):
         print(self.form)
