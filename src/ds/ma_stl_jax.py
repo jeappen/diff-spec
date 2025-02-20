@@ -1,3 +1,4 @@
+import functools as ft
 from typing import Optional
 
 import jax.lax
@@ -81,45 +82,112 @@ class CaTLPlus:
     Allows exponential robustness evaluation as in CaTL+ using the train_mode flag."""
 
     def __init__(self, cast: cAST):
-        self.cast = cast
-        self.single_operators = ("~")
-        self.binary_operators = ("&", "|", "U")
-        self.sequence_operators = ("U")  # ("G", "F", "U") ?
-        self.not_implemented = ("G", "F", "U", "->")
+        # self.cast = cast  # Original AST
+
+        single_operators = ("~",)
+        binary_operators = ("&", "|", "->", "U")
+        sequence_operators = ("G", "F", "U")
+        not_implemented = ("G", "F", "U", "->")
+        self.single_operators = tuple(OP_SYMBOLS[op] for op in single_operators)
+        self.binary_operators = tuple(OP_SYMBOLS[op] for op in binary_operators)
+        self.sequence_operators = tuple(OP_SYMBOLS[op] for op in sequence_operators)
+        self.time_bounded_operators = tuple(OP_SYMBOLS[op] for op in sequence_operators)
+        self.not_implemented = tuple(OP_SYMBOLS[op] for op in not_implemented)
         self.expr_repr = None
         self.end_t = None  # Populated when evaluating
         self.logger = logging.getLogger(__name__)
 
+        # Recursively transform the user-provided AST so that any string operator
+        # is replaced by its numeric code.
+        self.cast = self._transform_ast(cast)
+
+    def _transform_ast(self, node):
+        """Recursively walk the AST and replace any string operator with its numeric code."""
+        if self._is_leaf(node):
+            # Leaves (TaskBase, etc.) remain unchanged
+            return node
+
+        op = node[0]
+        # If operator is a string (like "G", "U", etc.) then map it to integer
+        if isinstance(op, str) and op in OP_SYMBOLS:
+            op_code = OP_SYMBOLS[op]
+
+            # Single-operator forms, e.g. NOT ("~")
+            if op_code == OP_SYMBOLS["~"]:
+                return [op_code, self._transform_ast(node[1])]
+
+            # Two-operand forms that also might have time windows:
+            # e.g. "G", "F" => shape: [ "G", sub_form, start, end ]
+            # e.g. "U" => [ "U", sub_form1, sub_form2, start, end ]
+            # e.g. "&", "|", "->" => [ op, sub_form1, sub_form2 ]
+            if op_code in (OP_SYMBOLS["G"], OP_SYMBOLS["F"]):
+                # time-bounded unary operator
+                return [
+                    op_code,
+                    self._transform_ast(node[1]),
+                    node[2],
+                    node[3],
+                ]
+            elif op_code == OP_SYMBOLS["U"]:
+                return [
+                    op_code,
+                    self._transform_ast(node[1]),
+                    self._transform_ast(node[2]),
+                    node[3],
+                    node[4],
+                ]
+            else:
+                # e.g. "&", "|", "->"
+                return [
+                    op_code,
+                    self._transform_ast(node[1]),
+                    self._transform_ast(node[2]),
+                ]
+        else:
+            # Possibly already transformed, or an unknown operator
+            # If it's a list of length >= 2, we still attempt recursion
+            if isinstance(node, list):
+                # Recursively transform each child that might be an operator
+                transformed_children = []
+                # The first element is either an already replaced op or something else
+                transformed_children.append(node[0])
+                for child in node[1:]:
+                    transformed_children.append(self._transform_ast(child))
+                return transformed_children
+
+        return node
+
     """
-        Syntax Functions
-        """
+    Syntax Functions
+    (They produce integer-coded cASTs rather than string-coded.)
+    """
 
     def __and__(self, other: "CaTLPlus") -> "CaTLPlus":
-        cast = ["&", self.cast, other.cast]
+        cast = [OP_SYMBOLS["&"], self.cast, other.cast]
         return CaTLPlus(cast)
 
     def __or__(self, other: "CaTLPlus") -> "CaTLPlus":
-        cast = ["|", self.cast, other.cast]
+        cast = [OP_SYMBOLS["|"], self.cast, other.cast]
         return CaTLPlus(cast)
 
     def __invert__(self) -> "CaTLPlus":
-        cast = ["~", self.cast]
+        cast = [OP_SYMBOLS["~"], self.cast]
         return CaTLPlus(cast)
 
     def implies(self, other: "CaTLPlus") -> "CaTLPlus":
-        cast = ["->", self.cast, other.cast]
+        cast = [OP_SYMBOLS["->"], self.cast, other.cast]
         return CaTLPlus(cast)
 
     def eventually(self, start: int, end: int):
-        cast = ["F", self.cast, start, end]
+        cast = [OP_SYMBOLS["F"], self.cast, start, end]
         return CaTLPlus(cast)
 
     def always(self, start: int, end: int) -> "CaTLPlus":
-        cast = ["G", self.cast, start, end]
+        cast = [OP_SYMBOLS["G"], self.cast, start, end]
         return CaTLPlus(cast)
 
     def until(self, other: "CaTLPlus", start: int, end: int) -> "CaTLPlus":
-        cast = ["U", self.cast, other.cast, start, end]
+        cast = [OP_SYMBOLS["U"], self.cast, other.cast, start, end]
         return CaTLPlus(cast)
 
     def eval_on_batch(self, path: jnp.array, t: int = 0, train_mode: bool = False) -> jnp.array:
@@ -129,7 +197,8 @@ class CaTLPlus:
         :param train_mode:   Whether to evaluate in training mode (conservative with shrink factor).
         :param t:               The time step to evaluate the formula at.
         """
-        return jax.vmap(self.eval, in_axes=0)(path, t, train_mode)
+        eval_fn = ft.partial(self.eval, train_mode=train_mode)
+        return jax.vmap(eval_fn, in_axes=0)(path, t)
 
     def eval(self, path: jnp.array, t: int = 0, train_mode: bool = False) -> jnp.array:
         """Evaluate the formula at time t. Training mode is for exponential robustness as in CaTL+.
@@ -152,16 +221,18 @@ class CaTLPlus:
         """Get max time of the formula. Runs in O(n) time where n is the number of nodes. Runs once then memoizes."""
         if self._is_leaf(cast):
             return 1
-        if cast[0] == "G":
-            # Add end time from inner formula since always is unrolled
+        op = cast[0]
+        if op == OP_SYMBOLS["G"]:
+            # add end time from inner formula
             return cast[-1] + self._get_end_time(cast[1])
-        if cast[0] in self.sequence_operators:
-            # The lcast two elements are the start and end times
+        elif op in self.sequence_operators:
+            # The last two elements are the start and end times
             return cast[-1]
-        if cast[0] == "~":
+        elif op == OP_SYMBOLS["~"]:
             return self._get_end_time(cast[1])
-        # Is binary operator
-        return max(self._get_end_time(cast[1]), self._get_end_time(cast[2]))
+        elif op in self.binary_operators:
+            return max(self._get_end_time(cast[1]), self._get_end_time(cast[2]))
+        return 1
 
     @staticmethod
     def _is_leaf(cast: cAST):
@@ -190,33 +261,32 @@ class CaTLPlus:
         if self._is_leaf(cast):
             return cast.eval_at_t(path, start_t, train_mode=train_mode)
 
-        if cast[0] in self.sequence_operators:
-            # NOTE: Overwrite start_t and end_t
+        op_code = cast[0]
+        # If it's one of the time-bounded operators (U, G, F), update start/end
+        if op_code in self.sequence_operators:  # "U" => 3
             start_t, end_t = start_t + cast[-2], start_t + cast[-1]
             if end_t > path.shape[1]:
                 self.logger.warning("end_t is larger than motion length")
 
-        if cast[0] in self.not_implemented:
-            raise NotImplementedError(f"Operator {cast[0]} is not implemented")
+        if op_code in self.not_implemented:
+            raise NotImplementedError(f"Operator {OP_SYMBOLS_INV[op_code]} is not implemented")
 
-        if cast[0] == "&":
-            res = self._eval_and(cast[1], cast[2], path, start_t, end_t, train_mode=train_mode)
-        elif cast[0] == "|":
-            res = self._eval_or(cast[1], cast[2], path, start_t, end_t, train_mode=train_mode)
-        elif cast[0] == "~":
-            res = self._eval_not(cast[1], path, start_t, end_t, train_mode=train_mode)
-        elif cast[0] == "->":
-            res = self._eval_implies(cast[1], cast[2], path, start_t, end_t, train_mode=train_mode)
-        elif cast[0] == "G":
-            res = self._eval_always(cast[1], path, start_t, end_t, train_mode=train_mode)
-        elif cast[0] == "F":
-            res = self._eval_eventually(cast[1], path, start_t, end_t, train_mode=train_mode)
-        elif cast[0] == "U":
-            res = self._eval_until(cast[1], cast[2], path, start_t, end_t, train_mode=train_mode)
-        else:
-            raise ValueError(f"Unknown operator {cast[0]}")
+        if op_code == OP_SYMBOLS["&"]:
+            return self._eval_and(cast[1], cast[2], path, start_t, end_t, train_mode=train_mode)
+        elif op_code == OP_SYMBOLS["|"]:
+            return self._eval_or(cast[1], cast[2], path, start_t, end_t, train_mode=train_mode)
+        elif op_code == OP_SYMBOLS["~"]:
+            return self._eval_not(cast[1], path, start_t, end_t, train_mode=train_mode)
+        elif op_code == OP_SYMBOLS["->"]:
+            return self._eval_implies(cast[1], cast[2], path, start_t, end_t, train_mode=train_mode)
+        elif op_code == OP_SYMBOLS["G"]:
+            return self._eval_always(cast[1], path, start_t, end_t, train_mode=train_mode)
+        elif op_code == OP_SYMBOLS["F"]:
+            return self._eval_eventually(cast[1], path, start_t, end_t, train_mode=train_mode)
+        elif op_code == OP_SYMBOLS["U"]:
+            return self._eval_until(cast[1], cast[2], path, start_t, end_t, train_mode=train_mode)
 
-        return res
+        raise ValueError(f"Unknown operator code {op_code}")
 
     def _flatten_and_or(self, cast: cAST, flat_and=True) -> list[cAST]:
         """
@@ -227,10 +297,10 @@ class CaTLPlus:
         # If it's not an AND node, just return it as a single-element list.
         stack = [cast]
         result = []
-        flat_char = "&" if flat_and else "|"
+        target_code = OP_SYMBOLS["&"] if flat_and else OP_SYMBOLS["|"]
         while stack:
             node = stack.pop()
-            if isinstance(node, list) and node[0] == flat_char:
+            if isinstance(node, list) and node[0] == target_code:
                 # node is of the form: ['&', left, right]
                 # push its children on the stack
                 stack.append(node[2])
@@ -251,7 +321,7 @@ class CaTLPlus:
     ) -> jnp.array:
         def regular_and(_sub_form1, _sub_form2, _path, _start_t, _end_t):
             _train_mode = False
-            subforms = self._flatten_and_or(["&", _sub_form1, _sub_form2], flat_and=True)
+            subforms = self._flatten_and_or([OP_SYMBOLS["&"], _sub_form1, _sub_form2], flat_and=True)
 
             # 2. Evaluate each subformula
             vals = [
@@ -265,7 +335,7 @@ class CaTLPlus:
 
         def exponential_and(_sub_form1, _sub_form2, _path, _start_t, _end_t):
             _train_mode = True
-            subforms = self._flatten_and_or(["&", _sub_form1, _sub_form2], flat_and=True)
+            subforms = self._flatten_and_or([OP_SYMBOLS["&"], _sub_form1, _sub_form2], flat_and=True)
 
             # 2. Evaluate each subformula
             vals = [
@@ -320,7 +390,7 @@ class CaTLPlus:
             train_mode: bool = False
     ) -> jnp.array:
         def regular_or(_sub_form1, _sub_form2, _path, _start_t, _end_t, _train_mode):
-            subforms = self._flatten_and_or(["|", _sub_form1, _sub_form2], flat_and=False)
+            subforms = self._flatten_and_or([OP_SYMBOLS["|"], sub_form1, sub_form2], flat_and=False)
 
             # 2. Evaluate each subformula
             vals = [
@@ -359,7 +429,7 @@ class CaTLPlus:
                     * self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode)
             )
         return self._eval_or(
-            ["~", sub_form1], sub_form2, path, start_t, end_t, train_mode=train_mode
+            [OP_SYMBOLS["~"], sub_form1], sub_form2, path, start_t, end_t, train_mode=train_mode
         )
 
     def _eval_always(
@@ -463,22 +533,17 @@ class CaTLPlus:
         if self.expr_repr is not None:
             return self.expr_repr
 
-        expr = self._extract_repr()
-
-        self.expr_repr = expr
-        return expr
+        self.expr_repr = self._extract_repr()
+        return self.expr_repr
 
     def _extract_repr(self, print_rich=False):
-        single_operators = ("~", "G", "F")
-        binary_operators = ("&", "|", "->", "U")
-        time_bounded_operators = ("G", "F", "U")
         # traverse cast
         operator_stack = [self.cast]
         expr = ""
         cur = self.cast
 
         def push_stack(cast):
-            if isinstance(cast, str) and cast in time_bounded_operators:
+            if isinstance(cast, int) and cast in self.time_bounded_operators:
                 time_window = f"[{cur[-2]}, {cur[-1]}]"
                 operator_stack.append(time_window)
             operator_stack.append(cast)
@@ -495,19 +560,14 @@ class CaTLPlus:
                     expr += cur
                 elif cur.startswith("["):
                     expr += colored(cur, "yellow") + " "
-                else:
-                    if cur in ("G", "F"):
-                        if cur == "F":
-                            expr += colored("F", "magenta")
-                        else:
-                            expr += colored(cur, "magenta")
-                    elif cur in ("&", "|", "->", "U"):
-                        expr += " " + colored(cur, "magenta")
-                        if cur != "U":
-                            expr += " "
-                    elif cur in ("~",):
-                        expr += colored(cur, "magenta")
-            elif cur[0] in single_operators:
+            elif isinstance(cur, int):
+                if cur in (OP_SYMBOLS["G"], OP_SYMBOLS["F"], OP_SYMBOLS["~"]):
+                    expr += colored(OP_SYMBOLS_INV[cur], "magenta")
+                elif cur in (OP_SYMBOLS["&"], OP_SYMBOLS["|"], OP_SYMBOLS["->"], OP_SYMBOLS["U"]):
+                    expr += " " + colored(OP_SYMBOLS_INV[cur], "magenta")
+                    if cur != OP_SYMBOLS["U"]:
+                        expr += " "
+            elif cur[0] in self.single_operators:
                 # single operator
                 if not self._is_leaf(cur[1]):
                     push_stack(")")
@@ -515,16 +575,16 @@ class CaTLPlus:
                 if not self._is_leaf(cur[1]):
                     push_stack("(")
                 push_stack(cur[0])
-            elif cur[0] in binary_operators:
+            elif cur[0] in self.binary_operators:
                 # binary operator
-                if not self._is_leaf(cur[2]) and cur[2][0] in binary_operators:
+                if not self._is_leaf(cur[2]) and cur[2][0] in self.binary_operators:
                     push_stack(")")
                     push_stack(cur[2])
                     push_stack("(")
                 else:
                     push_stack(cur[2])
                 push_stack(cur[0])
-                if not self._is_leaf(cur[1]) and cur[1][0] in binary_operators:
+                if not self._is_leaf(cur[1]) and cur[1][0] in self.binary_operators:
                     push_stack(")")
                     push_stack(cur[1])
                     push_stack("(")
@@ -559,12 +619,13 @@ class CaTLPlus:
 
         while queue:
             cur = queue.popleft()
+            op_code = cur[0]
 
             if self._is_leaf(cur):
                 all_preds.append(cur)
-            elif cur[0] in self.single_operators:
+            elif op_code in self.single_operators:
                 queue.append(cur[1])
-            elif cur[0] in self.binary_operators:
+            elif op_code in self.binary_operators:
                 queue.append(cur[1])
                 queue.append(cur[2])
             else:

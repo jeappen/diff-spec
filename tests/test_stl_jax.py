@@ -41,6 +41,13 @@ class TestJAXExamples(unittest.TestCase):
         self.cover_form = self.goal_1.eventually(0, 12) & self.goal_2.eventually(0, 12)
         self.seq_form = self.goal_1.eventually(0, 6) & self.goal_2.eventually(6, 12)
 
+        self.all_forms = [self.form, self.loop_form, self.cover_form, self.seq_form]
+
+    def test_repr(self):
+        print(self.form)
+        for form in self.all_forms:
+            print(form)
+
     def test_run(self):
         # TODO: Study jit decorator and see optimizations
         # jit(eval_reach_avoid)()
