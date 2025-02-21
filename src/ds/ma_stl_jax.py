@@ -1,4 +1,3 @@
-import functools as ft
 from typing import Optional
 
 import jax.lax
@@ -10,10 +9,10 @@ from .stl_jax import *
 
 class TaskBase(NamedTuple):
     """Base class for tasks in CaTL+ <https://ieeexplore.ieee.org/document/10156237>."""
-    name: str
+    name: int
     spec: STL
     num_satisfied_agents: int
-    capability: Optional[list[str]] = None  # Capability set for the task # TODO: Implement this
+    capability: Optional[list[int]] = None  # Capability set for the task # TODO: Implement this
 
     def eval_at_t(self, path: jnp.ndarray, t: int = 0, train_mode: bool = False) -> jnp.ndarray:
         return self.spec.eval(path, t, train_mode=train_mode)  # [:, 0]
@@ -31,7 +30,8 @@ class TaskBase(NamedTuple):
     #     raise NotImplementedError
 
     def __str__(self) -> str:
-        return self.name
+        # TODO: Implement better string representation
+        return f"Task {self.name} with spec {self.spec}"
 
     def __lt__(self, other: "TaskBase") -> bool:
         """Sort predicates by name."""
@@ -64,12 +64,6 @@ class Task(TaskBase):
         return super(Task, cls).__new__(cls, name, spec, num_satisfied_agents, capability)
 
 
-jtu.register_pytree_node(
-    Task,
-    lambda task: ((task.spec,), (task.name, task.num_satisfied_agents, task.capability)),  # Flatten
-    lambda aux, children: Task(aux[0], children[0], aux[1], aux[2])  # Unflatten
-)
-
 TASK_TYPES = (Task, TaskBase)
 
 cAST = TypeVar("AST", list, TaskBase)
@@ -99,7 +93,8 @@ class CaTLPlus:
 
         # Recursively transform the user-provided AST so that any string operator
         # is replaced by its numeric code.
-        self.cast = self._transform_ast(cast)
+        self.cast = cast
+        self.tuple_cast = list_to_tuple(cast)
 
     def _transform_ast(self, node):
         """Recursively walk the AST and replace any string operator with its numeric code."""
@@ -207,7 +202,7 @@ class CaTLPlus:
         :param train_mode:      Whether to evaluate in training mode (exponential robustness).
         :param t:               The time step to evaluate the formula at.
         """
-        return self._eval(self.cast, path, t, train_mode=train_mode)
+        return self._eval(self.tuple_cast, path, t, train_mode=train_mode)
 
     def end_time(self) -> int:
         """Get the end time of the formula efficiently."""
@@ -250,6 +245,7 @@ class CaTLPlus:
         ratio = softmax(tensor * HARDNESS, axis=axis)
         return jnp.sum(tensor * ratio, axis=axis)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval(
             self,
             cast: cAST,
@@ -310,6 +306,7 @@ class CaTLPlus:
                 result.append(node)
         return result
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_and(
             self,
             sub_form1: cAST,
@@ -380,6 +377,7 @@ class CaTLPlus:
         else:
             return regular_and(sub_form1, sub_form2, path, start_t, end_t)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_or(
             self,
             sub_form1: cAST,
@@ -404,6 +402,7 @@ class CaTLPlus:
 
         return regular_or(sub_form1, sub_form2, path, start_t, end_t, train_mode)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval_not(
             self,
             cast: cAST,
@@ -414,6 +413,7 @@ class CaTLPlus:
     ) -> jnp.array:
         return -self._eval(cast, path, start_t, end_t, train_mode=train_mode)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_implies(
             self,
             sub_form1: cAST,
@@ -432,6 +432,7 @@ class CaTLPlus:
             [OP_SYMBOLS["~"], sub_form1], sub_form2, path, start_t, end_t, train_mode=train_mode
         )
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval_always(
             self,
             sub_form: cAST,
@@ -457,6 +458,7 @@ class CaTLPlus:
 
         return self._tensor_min(val_per_time, axis=-1)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval_eventually(
             self,
             sub_form: cAST,
@@ -482,6 +484,7 @@ class CaTLPlus:
 
         return self._tensor_max(val_per_time, axis=-1)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_until(
             self,
             sub_form1: cAST,
@@ -632,3 +635,11 @@ class CaTLPlus:
                 raise RuntimeError("Should never visit here")
 
         return all_preds
+
+# TODO: Properly register if needed for use with JAX
+
+# jtu.register_pytree_node(
+#     Task,
+#     lambda task: ((task.spec,), (task.name, task.num_satisfied_agents, task.capability)),  # Flatten
+#     lambda aux, children: Task(aux[0], children[0], aux[1], aux[2])  # Unflatten
+# )

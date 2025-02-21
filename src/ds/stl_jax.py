@@ -28,11 +28,10 @@ inside_npy = ds_utils.inside_rectangle_formula
 import jax.numpy as jnp
 import jax
 import re
-import jax.tree_util as jtu
 
 
 class PredicateBase(NamedTuple):
-    name: str
+    name: int
 
     def eval_at_t(self, path: jnp.ndarray, t: int = 0, train_mode: bool = False) -> jnp.ndarray:
         return self.eval_whole_path(path, t, t + 1, train_mode=train_mode)[:, 0]
@@ -50,7 +49,8 @@ class PredicateBase(NamedTuple):
         raise NotImplementedError
 
     def __str__(self) -> str:
-        return self.name
+        # TODO: Get a better mapping to handle obs and goal
+        return f"Goal {self.name}"
 
     def __lt__(self, other: "PredicateBase") -> bool:
         """Sort predicates by name."""
@@ -64,7 +64,7 @@ class RectangularPredicate(NamedTuple):
 
     cent: np.ndarray
     size: np.ndarray
-    name: str
+    name: int
     shrink_factor: float = 1.0  # shrink (for reach) or expand (for avoid) the rectangle to make it more conservative
 
     @property
@@ -102,7 +102,7 @@ class RectangularPredicate(NamedTuple):
         return np.allclose(self.cent, other.cent) and np.allclose(self.size, other.size)
 
     def __str__(self) -> str:
-        return self.name
+        return f"Goal {self.name}"
 
     def __lt__(self, other: "RectangularPredicate") -> bool:
         """Sort predicates by name."""
@@ -345,6 +345,18 @@ OP_SYMBOLS = {
 # For debugging or printing back the operator from the integer code
 OP_SYMBOLS_INV = {v: k for k, v in OP_SYMBOLS.items()}
 
+import functools as ft
+
+
+def list_to_tuple(x):
+    if isinstance(x, list):
+        return tuple(list_to_tuple(e) for e in x)
+    return x
+
+
+STATIC_ARGNUMS_UNARY = (0, 1, 3, 4, 5)
+STATIC_ARGNUMS_BINARY = (0, 1, 2, 4, 5, 6)
+
 
 class STL:
     """
@@ -370,6 +382,11 @@ class STL:
         # Recursively transform the user-provided AST so that any string operator
         # is replaced by its numeric code.
         self.ast = ast
+        self.tuple_ast = list_to_tuple(ast)
+
+    def _preprocess_ast(self, ast):
+        """Preprocess the AST like flattening AND/OR chains."""
+        raise NotImplementedError("Fill in the preprocessing logic to flatten AND/OR chains.")
 
     def _transform_ast(self, node):
         """Recursively walk the AST and replace any string operator with its numeric code."""
@@ -466,7 +483,7 @@ class STL:
         :param train_mode:   Whether to evaluate in training mode (conservative with shrink factor).
         :param t:               The time step to evaluate the formula at.
         """
-        return self._eval(self.ast, path, t, train_mode=train_mode)
+        return self._eval(self.tuple_ast, path, t, train_mode=train_mode)
 
     def end_time(self) -> int:
         """Get the end time of the formula efficiently."""
@@ -492,6 +509,7 @@ class STL:
         # Is binary operator
         return max(self._get_end_time(ast[1]), self._get_end_time(ast[2]))
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval(
             self,
             ast: AST,
@@ -540,15 +558,16 @@ class STL:
         while stack:
             node = stack.pop()
             if isinstance(node, list) and node[0] == target_code:
-                # node is of the form: ['&', left, right]
+                # node is of the form: ['&', left, right] or ['|', left, right]
                 # push its children on the stack
                 stack.append(node[2])
                 stack.append(node[1])
             else:
-                # leaf node (predicate) or non-& operator
+                # leaf node (predicate) or non-& \ non-| node
                 result.append(node)
         return result
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_and(
             self,
             sub_form1: AST,
@@ -572,8 +591,22 @@ class STL:
             stacked = jnp.stack(vals, axis=-1)
             return self._tensor_min(stacked, axis=-1)
 
+        def pairwise_and(_sub_form1, _sub_form2, _path, _start_t, _end_t):
+            """This can cause  brittle or localized gradient."""
+            return self._tensor_min(
+                jnp.stack(
+                    [
+                        self._eval(_sub_form1, _path, _start_t, _end_t),
+                        self._eval(_sub_form2, _path, _start_t, _end_t),
+                    ],
+                    axis=-1,
+                ),
+                axis=-1,
+            )
+
         return regular_and(sub_form1, sub_form2, path, start_t, end_t)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_or(
             self,
             sub_form1: AST,
@@ -596,8 +629,22 @@ class STL:
             stacked = jnp.stack(vals, axis=-1)
             return self._tensor_max(stacked, axis=-1)
 
+        def pairwise_or(_sub_form1, _sub_form2, _path, _start_t, _end_t):
+            """This can cause  brittle or localized gradient."""
+            return self._tensor_max(
+                jnp.stack(
+                    [
+                        self._eval(_sub_form1, _path, _start_t, _end_t),
+                        self._eval(_sub_form2, _path, _start_t, _end_t),
+                    ],
+                    axis=-1,
+                ),
+                axis=-1,
+            )
+
         return regular_or(sub_form1, sub_form2, path, start_t, end_t, train_mode)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval_not(
             self,
             ast: AST,
@@ -608,6 +655,7 @@ class STL:
     ) -> jnp.array:
         return -self._eval(ast, path, start_t, end_t, train_mode=train_mode)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_implies(
             self,
             sub_form1: AST,
@@ -626,6 +674,7 @@ class STL:
             [OP_SYMBOLS["~"], sub_form1], sub_form2, path, start_t, end_t, train_mode=train_mode
         )
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval_always(
             self,
             sub_form: AST,
@@ -651,6 +700,7 @@ class STL:
 
         return self._tensor_min(val_per_time, axis=-1)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval_eventually(
             self,
             sub_form: AST,
@@ -676,6 +726,7 @@ class STL:
 
         return self._tensor_max(val_per_time, axis=-1)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_until(
             self,
             sub_form1: AST,
@@ -913,26 +964,25 @@ class STL:
 
         return all_preds
 
+# TODO: Properly register if needed for use with JAX
 
-# Register for use with JAX
-
-# Register PredicateBase as a PyTree
-jtu.register_pytree_node(
-    PredicateBase,
-    lambda pred: ((), (pred.name,)),  # Flatten: no JAX-tracked fields, only auxiliary data
-    lambda aux, _: PredicateBase(aux[0])  # Unflatten
-)
-
-# Register RectangularPredicate as a PyTree
-jtu.register_pytree_node(
-    RectangularPredicate,
-    lambda pred: ((pred.cent, pred.size), (pred.name, pred.shrink_factor)),  # Flatten
-    lambda aux, children: RectangularPredicate(children[0], children[1], aux[0], aux[1])  # Unflatten
-)
-
-# Register STL as a PyTree
-jtu.register_pytree_node(
-    STL,
-    lambda stl: ((stl.ast,), ()),  # Flatten: AST (JAX-tracked), no auxiliary data
-    lambda aux, children: STL(children[0])  # Unflatten
-)
+# # Register PredicateBase as a PyTree
+# jtu.register_pytree_node(
+#     PredicateBase,
+#     lambda pred: ((), (pred.name,)),  # Flatten: no JAX-tracked fields, only auxiliary data
+#     lambda aux, _: PredicateBase(aux[0])  # Unflatten
+# )
+#
+# # Register RectangularPredicate as a PyTree
+# jtu.register_pytree_node(
+#     RectangularPredicate,
+#     lambda pred: ((pred.cent, pred.size), (pred.name, pred.shrink_factor)),  # Flatten
+#     lambda aux, children: RectangularPredicate(children[0], children[1], aux[0], aux[1])  # Unflatten
+# )
+#
+# # Register STL as a PyTree
+# jtu.register_pytree_node(
+#     STL,
+#     lambda stl: ((stl.ast,), ()),  # Flatten: AST (JAX-tracked), no auxiliary data
+#     lambda aux, children: STL(children[0])  # Unflatten
+# )

@@ -36,15 +36,18 @@ class TestMASTLJAXExamples(unittest.TestCase):
         self.seq_inv_form = self.goal_2.eventually(0, 6) & self.goal_1.eventually(6, 12)
 
         self.num_satisfied_agents = 2
-        task = Task("task", self.form, self.num_satisfied_agents, None)
-        task_seq = Task("task_seq", self.seq_form, self.num_satisfied_agents, None)
-        task_seq_inv = Task("task_seq_inv", self.seq_inv_form, self.num_satisfied_agents, None)
-        task_cover = Task("task_cover", self.cover_form, self.num_satisfied_agents, None)
-        task_loop = Task("task_loop", self.loop_form, self.num_satisfied_agents, None)
+        task = Task(1, self.form, self.num_satisfied_agents, None)
+        task_seq = Task(2, self.seq_form, self.num_satisfied_agents, None)
+        task_seq_inv = Task(3, self.seq_inv_form, self.num_satisfied_agents, None)
+        task_cover = Task(4, self.cover_form, self.num_satisfied_agents, None)
+        task_loop = Task(5, self.loop_form, self.num_satisfied_agents, None)
+        TASK_NAMES = ["task", "task_seq", "task_seq_inv", "task_cover", "task_loop"]
         self.catl_form = CaTLPlus(task)
         self.catl_form_or = CaTLPlus(task) | CaTLPlus(task_seq)
         self.catl_form_and = CaTLPlus(task_cover) & CaTLPlus(task_seq)
         self.catl_form_3and = CaTLPlus(task_cover) & CaTLPlus(task_seq) & CaTLPlus(task_seq_inv)
+
+        self.all_catl_forms = [self.catl_form, self.catl_form_or, self.catl_form_and, self.catl_form_3and]
 
     def test_evaluations(self, num_tiles=3):
         """Run simple evaluations to test shapes and types"""
@@ -197,22 +200,33 @@ class TestMASTLJAXExamples(unittest.TestCase):
         ]
 
         # Helper function to evaluate and assert based on expected outcome.
-        def check_eval(form, path_key, train_mode):
+
+        form_evals = list(map(lambda x: x[0].eval, test_cases))
+        paths_to_test_list = list(map(lambda x: paths[x[1]][0], test_cases))
+
+        def check_eval(i_eval, path_data, train_mode=False):
+            return form_evals[i_eval](path_data, train_mode=train_mode)
+
+        def eval_result(_loss, path_key, train_mode):
             path_data, expected_sign = paths[path_key]
-            loss = form.eval(path_data, train_mode=train_mode)
             if expected_sign > 0:
-                self.assertGreater(loss, 0, f"{path_key} failed in train_mode={train_mode}")
+                self.assertGreater(_loss, 0, f"{path_key} failed in train_mode={train_mode}")
             else:
-                self.assertLess(loss, 0, f"{path_key} failed in train_mode={train_mode}")
+                self.assertLess(_loss, 0, f"{path_key} failed in train_mode={train_mode}")
 
         # Iterate over test cases for both training modes
         for train_mode in [False, True]:
-            for form, path_key, message in test_cases:
-                check_eval(form, path_key, train_mode)
+            # check_eval_fn = jit(ft.partial(check_eval, train_mode=train_mode))
+            # TODO: jit over all the test cases
+            # Now check the results
+            for i, path in enumerate(paths_to_test_list):
+                loss = check_eval(i, path, train_mode)
+                eval_result(loss, test_cases[i][1], train_mode)
 
     def test_repr(self):
         print(self.form)
-        print(self.catl_form)
+        for form in self.all_catl_forms:
+            print(form)
 
     def _test_run(self):
         # TODO: Study jit decorator and see optimizations

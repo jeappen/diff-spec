@@ -29,9 +29,9 @@ class TestJAXExamples(unittest.TestCase):
 
         self.key = jax.random.PRNGKey(0)
 
-        self.goal_1 = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1]), "goal_1"))
+        self.goal_1 = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1]), 1))
         # goal_2 is a rectangle area centered in [2, 2] with width and height 1
-        self.goal_2 = STL(RectReachPredicate(np.array([2, 2]), np.array([1, 1]), "goal_2"))
+        self.goal_2 = STL(RectReachPredicate(np.array([2, 2]), np.array([1, 1]), 2))
 
         # form is the formula goal_1 eventually in 0 to 5 and goal_2 eventually in 0 to 5
         # and that holds always in 0 to 8
