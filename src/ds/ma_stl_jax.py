@@ -6,6 +6,9 @@ from .stl_jax import *
 
 """Multi agent STL specifications"""
 
+EXP_ROBUSTNESS_ALPHA = 1.0  # For task exponential robustness
+EXP_ROBUSTNESS_BETA = .5  # For AND exponential robustness
+
 
 class TaskBase(NamedTuple):
     """Base class for tasks in CaTL+ <https://ieeexplore.ieee.org/document/10156237>."""
@@ -31,7 +34,7 @@ class TaskBase(NamedTuple):
 
     def __str__(self) -> str:
         # TODO: Implement better string representation
-        return f"Task {self.name} with spec {self.spec}"
+        return f"Task {self.name} with spec \'{self.spec}\'"
 
     def __lt__(self, other: "TaskBase") -> bool:
         """Sort predicates by name."""
@@ -47,11 +50,46 @@ class Task(TaskBase):
         # NOTE: Does not support end_t
         # TODO: If train_mode, return the exponential robustness
         # return self.spec.eval(path, start_t, train_mode) > 0
-        topk_val, topk_ind = jax.lax.top_k(self.spec.eval(path, start_t, train_mode=train_mode),
-                                           self.num_satisfied_agents)
+        if train_mode:
+            return self.exponential_val(path, start_t, train_mode)
+        else:
+            return self.regular_val(path, start_t, train_mode)
 
+    def exponential_val(self, path, start_t, train_mode):
+        topk_vals, topk_ind = jax.lax.top_k(self.spec.eval(path, start_t, train_mode=train_mode),
+                                            self.num_satisfied_agents)
+        vals = self.spec.eval(path, start_t, train_mode=train_mode)
+        topk_val = topk_vals[-1]
+        # Compute an index based on the sign of min_val:
+        #   0 -> negative, 1 -> positive, 2 -> zero.
+
+        branch_index = jnp.where(topk_val < 0,
+                                 0,
+                                 jnp.where(topk_val > 0, 1, 2))
+
+        def negative(_stacked_vals, _topk_val):
+            # When min is negative
+            return -2 * EXP_ROBUSTNESS_ALPHA * (jnp.exp(-_stacked_vals) - 1) / (
+                    1 + jnp.exp(EXP_ROBUSTNESS_ALPHA * (_stacked_vals - _topk_val)))
+
+        def positive(_stacked_vals, _topk_val):
+            # When min is positive; note the rearrangement for the given formula.
+            return 2 * EXP_ROBUSTNESS_ALPHA * (jnp.exp(_stacked_vals) - 1) / (
+                    1 + jnp.exp(-EXP_ROBUSTNESS_ALPHA * (_stacked_vals - _topk_val)))
+
+        # List of branch functions. Each branch must have the same output type.
+        branches = [negative, positive, negative]
+
+        # Use jax.lax.switch to select and run the correct branch.
+        res = jax.lax.switch(branch_index, branches, vals, topk_val)
+
+        return res.mean()
+
+    def regular_val(self, path, start_t, train_mode):
+        topk_vals, topk_ind = jax.lax.top_k(self.spec.eval(path, start_t, train_mode=train_mode),
+                                            self.num_satisfied_agents)
         # Only evaluate satisfaction (not best for gradient updates since only m-th best is considered)
-        return topk_val[-1]
+        return topk_vals[-1]
 
     def eval_at_t(self, path: jnp.ndarray, t: int = 0, train_mode: bool = False) -> jnp.ndarray:
         return self.eval_whole_path(path, t, t + 1, train_mode)
@@ -67,8 +105,6 @@ class Task(TaskBase):
 TASK_TYPES = (Task, TaskBase)
 
 cAST = TypeVar("AST", list, TaskBase)
-
-EXP_ROBUSTNESS_BETA = .5
 
 
 class CaTLPlus:
@@ -362,7 +398,7 @@ class CaTLPlus:
 
             def zero(_stacked_vals, _min_val):
                 # When min is zero, simply return _min_val (which is zero)
-                return jnp.ones_like(stacked) * _min_val
+                return jnp.ones_like(_stacked_vals) * _min_val
 
             # List of branch functions. Each branch must have the same output type.
             branches = [negative, positive, zero]
@@ -387,6 +423,7 @@ class CaTLPlus:
             end_t: int = None,
             train_mode: bool = False
     ) -> jnp.array:
+        # TODO: Implement exponential robustness for OR as inverse of AND
         def regular_or(_sub_form1, _sub_form2, _path, _start_t, _end_t, _train_mode):
             subforms = self._flatten_and_or([OP_SYMBOLS["|"], sub_form1, sub_form2], flat_and=False)
 
