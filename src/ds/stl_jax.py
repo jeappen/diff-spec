@@ -182,6 +182,9 @@ class RectAvoidPredicate(RectangularPredicate):
 
         return res
 
+    def __str__(self) -> str:
+        return f"Obs {self.name}"
+
     def get_stlpy_form(self) -> STLTree:
         """Use Numpy to ensure compatibility with STLpy."""
         bounds = np.stack(
@@ -492,6 +495,17 @@ class STL:
             # Get max of binary tree at self.ast
             self.end_t = self._get_end_time(self.ast)
         return self.end_t
+
+    def get_all_or(self, ast: AST = None) -> list["STL"]:
+        """Get all OR subformulas at the highest level. For use in balance spec for MA-STL"""
+        if ast is None:
+            ast = self.ast
+        if self._is_leaf(ast):
+            return []
+        op = ast[0]
+        if op == OP_SYMBOLS["|"]:
+            return self.get_all_or(ast[1]) + self.get_all_or(ast[2])
+        return [STL(ast)]
 
     def _get_end_time(self, ast: AST) -> int:
         """Get max time of the formula. Runs in O(n) time where n is the number of nodes. Runs once then memoizes."""

@@ -213,6 +213,94 @@ def backward(jax_key=None, avoid_spec=False, mute=True):
     return path, loss
 
 
+def mabackward(jax_key=None, ma_stl_spec=None, avoid_spec=False, mute=True):
+    """
+    Planning with gradient descent
+    """
+
+    assert ma_stl_spec is not None
+
+    np_path = np.array(
+        [
+            [
+                [1, 0],
+                [1, 0],
+                [1, 0],
+                [1, 0],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [1, 0],
+                [1, 0],
+            ],
+        ]
+    )
+
+    loss = None
+    lr = 0.1
+    num_iterations = 1000
+    num_agents = 8
+
+    if os.environ.get("DIFF_STL_BACKEND") == "jax":
+
+        if jax_key is None:
+            jax_key = jax.random.PRNGKey(0)
+        random_like = jax.random.normal(jax_key, (num_agents,) + np_path[0].shape)
+        path = ds_utils.default_tensor(random_like)
+
+        solver = optax.adam(lr)
+        var_solver_state = solver.init(path)
+
+        stl_form_eval_train = lambda x: -ma_stl_spec.eval(x, train_mode=True).mean()
+        stl_form_eval_test = lambda x: -ma_stl_spec.eval(x).mean()
+
+        @jax.jit
+        def train_step(carry, _):
+            # Performs a one step update.
+            params, solver_state = carry
+            (loss), grad = jax.value_and_grad(stl_form_eval_train)(
+                params
+            )
+            updates, solver_state = solver.update(grad, solver_state)
+            params = optax.apply_updates(params, updates)
+            return (params, solver_state), loss
+
+        # Above using jax.lax.scan
+        (path, var_solver_state), train_losses = jax.lax.scan(train_step, (path, var_solver_state),
+                                                              length=num_iterations)
+
+        loss = stl_form_eval_test(path)
+    else:
+
+        random_like = np.random.rand(*((num_agents,) + np_path[0].shape))
+        path = ds_utils.default_tensor(random_like)
+        # PyTorch backend (slower when num_iterations is high)
+        path.requires_grad = True
+        opt = Adam(params=[path], lr=lr)
+
+        # ds_utils.HARDNESS = 3.0
+
+        for _ in range(num_iterations):
+            loss = -torch.mean(ma_stl_spec.eval(path))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+        if not mute:
+            print(f"final loss: {loss.item()}")
+            print(path)
+
+            plt.plot(path[0, :, 0].numpy(force=True), path[0, :, 1].numpy(force=True))
+            plt.show()
+
+    return path, loss
+
+
 if __name__ == "__main__":
     eval_reach_avoid()
     backward()

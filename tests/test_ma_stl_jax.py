@@ -5,13 +5,13 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax import jit
 
 os.environ["DIFF_STL_BACKEND"] = "jax"  # So ds_utils does not require torch
 
 import ds.utils as ds_utils
 from ds.stl_jax import STL, RectReachPredicate
 from ds.ma_stl_jax import CaTLPlus, Task
+import examples.stl.differentiability as stl_diff_examples
 
 TEST_TOLERANCE = 1e-3  # Small number close to 0
 
@@ -228,30 +228,13 @@ class TestMASTLJAXExamples(unittest.TestCase):
         for form in self.all_catl_forms:
             print(form)
 
-    def _test_run(self):
-        # TODO: Study jit decorator and see optimizations
-        # jit(eval_reach_avoid)()
-
-        final_result = []
-        for _ in range(1000):
-            # Magic of jax
-            res = jit(stl_diff_examples.eval_reach_avoid)()
-            final_result.append(res)
-            # Match expected output
-            assert jnp.all((res[0] > 0) == jnp.array([True, False, False]))
-            assert jnp.all((res[1] > 0) == jnp.array([True, False, True]))
-
-        print(final_result)
+    def test_run(self):
 
         # Test differentiability
-        path, loss = stl_diff_examples.backward()
-        print('Path', path)
-        assert loss < TEST_TOLERANCE  # Loss should be less than 0 to satisfy the formula
-        # (jax.lax.fori_loop(0, 1000, lambda i, _: jit(eval_reach_avoid)(), None)).block_until_ready()
-        # for _ in range(1000):
-        #     eval_reach_avoid()
-        #
-        # self.assertEqual(True, False)  # add assertion here
+        for catl_form in self.all_catl_forms:
+            path, loss = stl_diff_examples.mabackward(ma_stl_spec=catl_form)
+            print('loss', loss)
+            assert loss < TEST_TOLERANCE  # Loss should be less than 0 to satisfy the formula
 
     def _test_avoid_backward(self):
         path, loss = stl_diff_examples.backward(avoid_spec=True)

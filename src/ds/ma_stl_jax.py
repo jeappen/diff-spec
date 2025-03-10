@@ -34,7 +34,7 @@ class TaskBase(NamedTuple):
 
     def __str__(self) -> str:
         # TODO: Implement better string representation
-        return f"Task {self.name} with spec \'{self.spec}\'"
+        return f"<Task {self.name} with spec \'{self.spec}\' , m={self.num_satisfied_agents}, capability={self.capability}>"
 
     def __lt__(self, other: "TaskBase") -> bool:
         """Sort predicates by name."""
@@ -239,6 +239,10 @@ class CaTLPlus:
         :param t:               The time step to evaluate the formula at.
         """
         return self._eval(self.tuple_cast, path, t, train_mode=train_mode)
+
+    def eval_train(self, path: jnp.array, t: int = 0) -> jnp.array:
+        """To help prevent recompilation in jax.jit, we separate the training mode evaluation."""
+        return self.eval(path, t, train_mode=True)
 
     def end_time(self) -> int:
         """Get the end time of the formula efficiently."""
