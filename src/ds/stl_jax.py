@@ -115,6 +115,7 @@ class RectangularPredicate(NamedTuple):
 
 # PREDICATE_FORM = TypeVar("PREDICATE_FORM", RectangularPredicate, PredicateBase)
 PREDICATE_TYPES = (RectangularPredicate, PredicateBase)
+SHRINK_NORM = 2  # Conservative norm used : 1 | 2 | jnp.inf
 
 
 class RectReachPredicate(RectangularPredicate):
@@ -130,10 +131,28 @@ class RectReachPredicate(RectangularPredicate):
         eval_path = path[:, start_t:end_t]
 
         def with_shrink(_eval_path):
-            return jnp.min(
-                # Adding shrink factor to make it more conservative
-                (self.size_tensor * 0.8 / 2) ** 2 - jnp.square(_eval_path - self.cent_tensor), axis=-1
-            )
+            """L-SHRINK_NORM Norm version for conservative evaluation"""
+            if SHRINK_NORM == 2:
+                # Multiply this factor to get an inner circle matching reach
+                shrink_multiplier = 1 / jnp.sqrt(2)
+            else:
+                shrink_multiplier = 1
+            return jnp.linalg.norm(self.size_tensor * self.shrink_factor * shrink_multiplier / 2,
+                                   ord=SHRINK_NORM) - jnp.linalg.norm(
+                _eval_path - self.cent_tensor, axis=-1, ord=SHRINK_NORM)
+            # # Adding shrink factor to make it more conservative
+            # # self.size_tensor * ( 0.2  / 2) - jnp.abs(_eval_path - self.cent_tensor), axis=-1
+            # # jnp.linalg.norm(self.size_tensor * 0.6 / 2) - jnp.linalg.norm(_eval_path - self.cent_tensor, axis=-1)
+            # axis=-1
+            # # (self.size_tensor * 0.7 / 2) ** 2 - jnp.square(_eval_path - self.cent_tensor), axis=-1
+
+            # jnp.min(
+            #     # Adding shrink factor to make it more conservative
+            #     self.size_tensor * ( 0.2  / 2) - jnp.abs(_eval_path - self.cent_tensor), axis=-1
+            #     # jnp.linalg.norm(self.size_tensor * 0.6 / 2) - jnp.linalg.norm(_eval_path - self.cent_tensor, axis=-1),
+            #     # axis=-1
+            #     # (self.size_tensor * 0.7 / 2) ** 2 - jnp.square(_eval_path - self.cent_tensor), axis=-1
+            # )
 
         def without_shrink(_eval_path):
             return jnp.min(
@@ -168,7 +187,7 @@ class RectAvoidPredicate(RectangularPredicate):
         def with_shrink(_eval_path):
             return jnp.max(
                 # Adding shrink factor to make it more conservative
-                jnp.square(_eval_path - self.cent_tensor) - (self.size_tensor * (1 + self.shrink_factor) / 2) ** 2,
+                jnp.square(_eval_path - self.cent_tensor) - (self.size_tensor * (2 - self.shrink_factor) / 2) ** 2,
                 axis=-1
             )
 
@@ -188,7 +207,7 @@ class RectAvoidPredicate(RectangularPredicate):
     def get_stlpy_form(self) -> STLTree:
         """Use Numpy to ensure compatibility with STLpy."""
         bounds = np.stack(
-            [self.cent - self.size * (1 + self.shrink_factor) / 2, self.cent + self.size / 2]
+            [self.cent - self.size * (2 - self.shrink_factor) / 2, self.cent + self.size * (2 - self.shrink_factor) / 2]
         ).T.flatten()
         return outside_npy(bounds, 0, 1, 2, self.name)
 
@@ -436,7 +455,7 @@ class STL:
         else:
             # Possibly already transformed, or an unknown operator
             # If it's a list of length >= 2, we still attempt recursion
-            if isinstance(node, list):
+            if isinstance(node, list) or isinstance(node, tuple):
                 # Recursively transform each child that might be an operator
                 transformed_children = []
                 # The first element is either an already replaced op or something else
@@ -488,6 +507,10 @@ class STL:
         """
         return self._eval(self.tuple_ast, path, t, train_mode=train_mode)
 
+    def eval_train(self, path: jnp.array, t: int = 0) -> jnp.array:
+        """To help prevent recompilation in jax.jit, we separate the training mode evaluation."""
+        return self.eval(path, t, train_mode=True)
+
     def end_time(self) -> int:
         """Get the end time of the formula efficiently."""
         if self.end_t is None:
@@ -495,17 +518,6 @@ class STL:
             # Get max of binary tree at self.ast
             self.end_t = self._get_end_time(self.ast)
         return self.end_t
-
-    def get_all_or(self, ast: AST = None) -> list["STL"]:
-        """Get all OR subformulas at the highest level. For use in balance spec for MA-STL"""
-        if ast is None:
-            ast = self.ast
-        if self._is_leaf(ast):
-            return []
-        op = ast[0]
-        if op == OP_SYMBOLS["|"]:
-            return self.get_all_or(ast[1]) + self.get_all_or(ast[2])
-        return [STL(ast)]
 
     def _get_end_time(self, ast: AST) -> int:
         """Get max time of the formula. Runs in O(n) time where n is the number of nodes. Runs once then memoizes."""
@@ -571,7 +583,7 @@ class STL:
         target_code = OP_SYMBOLS["&"] if flat_and else OP_SYMBOLS["|"]
         while stack:
             node = stack.pop()
-            if isinstance(node, list) and node[0] == target_code:
+            if (isinstance(node, list) or isinstance(node, tuple)) and node[0] == target_code:
                 # node is of the form: ['&', left, right] or ['|', left, right]
                 # push its children on the stack
                 stack.append(node[2])

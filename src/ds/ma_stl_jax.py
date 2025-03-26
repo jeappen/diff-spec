@@ -1,6 +1,7 @@
 from typing import Optional
 
 import jax.lax
+from jax import Array
 
 from .stl_jax import *
 
@@ -95,7 +96,7 @@ class Task(TaskBase):
         return self.eval_whole_path(path, t, t + 1, train_mode)
 
     def count_satisfied_agents(self, path: jnp.ndarray, start_t: int = 0, end_t: int = None,
-                               train_mode: bool = False) -> int:
+                               train_mode: bool = False) -> Array:
         return jnp.sum(self.eval_whole_path(path, start_t, end_t, train_mode) > 0)
 
     def __new__(cls, name, spec, num_satisfied_agents, capability=None):
@@ -177,7 +178,7 @@ class CaTLPlus:
         else:
             # Possibly already transformed, or an unknown operator
             # If it's a list of length >= 2, we still attempt recursion
-            if isinstance(node, list):
+            if isinstance(node, list) or isinstance(node, tuple):
                 # Recursively transform each child that might be an operator
                 transformed_children = []
                 # The first element is either an already replaced op or something else
@@ -336,7 +337,7 @@ class CaTLPlus:
         target_code = OP_SYMBOLS["&"] if flat_and else OP_SYMBOLS["|"]
         while stack:
             node = stack.pop()
-            if isinstance(node, list) and node[0] == target_code:
+            if (isinstance(node, list) or isinstance(node, tuple)) and node[0] == target_code:
                 # node is of the form: ['&', left, right]
                 # push its children on the stack
                 stack.append(node[2])
