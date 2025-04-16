@@ -1,14 +1,14 @@
+from collections import deque
+
 import importlib
 import io
+import numpy as np
 import os
 from abc import abstractmethod
-from collections import deque
 from contextlib import redirect_stdout
-from typing import TypeVar, NamedTuple
-
-import numpy as np
 from jax.nn import softmax
 from stlpy.STL import LinearPredicate as baseLinearPredicate, STLTree
+from typing import TypeVar, NamedTuple
 
 os.environ["DIFF_STL_BACKEND"] = "jax"  # set the backend to JAX for all child processes
 import ds.utils as ds_utils
@@ -105,8 +105,9 @@ class RectangularPredicate(NamedTuple):
         return f"Goal {self.name}"
 
     def __lt__(self, other: "RectangularPredicate") -> bool:
-        """Sort predicates by name."""
-        return self.name < other.name
+        """Sort predicates by center (prioritizing y). To get consistent ordering."""
+        return (self.cent[1] < other.cent[1]) or (
+                np.allclose(self.cent[1], other.cent[1]) and self.cent[0] < other.cent[0])
 
     def __rich_repr__(self):
         # Assumes that size is common and not important
