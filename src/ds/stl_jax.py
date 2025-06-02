@@ -75,6 +75,11 @@ class RectangularPredicate(NamedTuple):
     def cent_tensor(self):
         return ds_utils.default_tensor(self.cent)
 
+    @property
+    def state_dim(self):
+        """Get the state dimension of the predicate."""
+        return self.cent.shape[0]
+
     def eval_at_t(self, path: jnp.ndarray, t: int = 0, train_mode: bool = False) -> jnp.ndarray:
         return self.eval_whole_path(path, t, t + 1, train_mode=train_mode)[:, 0]
 
@@ -169,7 +174,7 @@ class RectReachPredicate(RectangularPredicate):
         bounds = np.stack(
             [self.cent - self.size * self.shrink_factor / 2, self.cent + self.size * self.shrink_factor / 2]
         ).T.flatten()
-        return inside_npy(bounds, 0, 1, 2, self.name)
+        return inside_npy(bounds, 0, 1, self.state_dim, self.name)
 
 
 class RectAvoidPredicate(RectangularPredicate):
@@ -180,7 +185,7 @@ class RectAvoidPredicate(RectangularPredicate):
     def eval_whole_path(
             self, path: jnp.array, start_t: int = 0, end_t: int = None,
             train_mode: bool = False
-    ) -> jnp.array:
+    ) -> jnp.array:  
         """Stick to JAX when possible."""
         assert len(path.shape) == 3, "motion must be in batch"
         eval_path = path[:, start_t:end_t]

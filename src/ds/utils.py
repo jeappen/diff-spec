@@ -32,7 +32,7 @@ else:
 from stlpy.STL import LinearPredicate, NonlinearPredicate, STLTree
 
 
-def inside_rectangle_formula(bounds, y1_index, y2_index, d, name=None):
+def inside_rectangle_formula(bounds, y1_index, y2_index, d, name=None, y3_index=2):
     """
     Create an STL formula representing being inside a
     rectangle with the given bounds:
@@ -58,9 +58,15 @@ def inside_rectangle_formula(bounds, y1_index, y2_index, d, name=None):
     """
     assert y1_index < d, "index must be less than signal dimension"
     assert y2_index < d, "index must be less than signal dimension"
+    assert y3_index < d, "index must be less than signal dimension"
 
     # Unpack the bounds
-    y1_min, y1_max, y2_min, y2_max = bounds
+    two_dim = (d == 2)
+    if two_dim:
+        y1_min, y1_max, y2_min, y2_max = bounds
+    else:
+        assert (len(bounds) == 6), "bounds must be a tuple of length 4 or 6"
+        y1_min, y1_max, y2_min, y2_max, y3_min, y3_max = bounds
 
     # Create predicates a*y >= b for each side of the rectangle
     a1 = np.zeros((1, d))
@@ -73,8 +79,16 @@ def inside_rectangle_formula(bounds, y1_index, y2_index, d, name=None):
     top = LinearPredicate(a2, y2_min)
     bottom = LinearPredicate(-a2, -y2_max)
 
+    if not two_dim:
+        a3 = np.zeros((1, d))
+        a3[:, y3_index] = 1
+        ztop = LinearPredicate(a3, y3_min)
+        zbottom = LinearPredicate(-a3, -y3_max)
+
     # Take the conjuction across all the sides
     inside_rectangle = right & left & top & bottom
+    if not two_dim:
+        inside_rectangle = inside_rectangle & ztop & zbottom
 
     # set the names
     if name is not None:
