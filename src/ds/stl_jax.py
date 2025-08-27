@@ -523,7 +523,7 @@ class STL:
     def _get_end_time(self, ast: AST) -> int:
         """Get max time of the formula. Runs in O(n) time where n is the number of nodes. Runs once then memoizes."""
         if self._is_leaf(ast):
-            return 1
+            return 0
         op = ast[0]
         if op == OP_SYMBOLS["G"]:
             # add end time from inner formula
