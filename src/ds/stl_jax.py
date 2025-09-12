@@ -1,14 +1,14 @@
+from collections import deque
+
 import importlib
 import io
+import numpy as np
 import os
 from abc import abstractmethod
-from collections import deque
 from contextlib import redirect_stdout
-from typing import TypeVar
-
-import numpy as np
 from jax.nn import softmax
 from stlpy.STL import LinearPredicate as baseLinearPredicate, STLTree
+from typing import TypeVar, NamedTuple
 
 os.environ["DIFF_STL_BACKEND"] = "jax"  # set the backend to JAX for all child processes
 import ds.utils as ds_utils
@@ -26,19 +26,19 @@ inside_npy = ds_utils.inside_rectangle_formula
 
 # Replace with JAX
 import jax.numpy as jnp
+import jax
 import re
 
-class PredicateBase:
-    def __init__(self, name: str):
-        self.name = name
-        self.logger = logging.getLogger(__name__)
 
-    def eval_at_t(self, path: jnp.ndarray, t: int = 0) -> jnp.ndarray:
-        return self.eval_whole_path(path, t, t + 1)[:, 0]
+class PredicateBase(NamedTuple):
+    name: int
+
+    def eval_at_t(self, path: jnp.ndarray, t: int = 0, train_mode: bool = False) -> jnp.ndarray:
+        return self.eval_whole_path(path, t, t + 1, train_mode=train_mode)[:, 0]
 
     @abstractmethod
     def eval_whole_path(
-            self, path: jnp.ndarray, start_t: int = 0, end_t: int = None
+            self, path: jnp.ndarray, start_t: int = 0, end_t: int = None, train_mode: bool = False
     ) -> jnp.ndarray:
         """Stick to JAX when possible."""
         raise NotImplementedError
@@ -49,10 +49,74 @@ class PredicateBase:
         raise NotImplementedError
 
     def __str__(self) -> str:
-        return self.name
+        # TODO: Get a better mapping to handle obs and goal
+        return f"Goal {self.name}"
 
-    def __lt__(self, other):
+    def __lt__(self, other: "PredicateBase") -> bool:
+        """Sort predicates by name."""
         return self.name < other.name
+
+
+class RectangularPredicate(NamedTuple):
+    """
+        Rectangle reachability predicate
+        """
+
+    cent: np.ndarray
+    size: np.ndarray
+    name: int
+    shrink_factor: float = 1.0  # shrink (for reach) or expand (for avoid) the rectangle to make it more conservative
+
+    @property
+    def size_tensor(self):
+        return ds_utils.default_tensor(self.size)
+
+    @property
+    def cent_tensor(self):
+        return ds_utils.default_tensor(self.cent)
+
+    def eval_at_t(self, path: jnp.ndarray, t: int = 0, train_mode: bool = False) -> jnp.ndarray:
+        return self.eval_whole_path(path, t, t + 1, train_mode=train_mode)[:, 0]
+
+    @abstractmethod
+    def eval_whole_path(
+            self, path: jnp.ndarray, start_t: int = 0, end_t: int = None,
+            train_mode: bool = False
+    ) -> jnp.ndarray:
+        """Stick to JAX when possible."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_stlpy_form(self) -> STLTree:
+        """Use Numpy to ensure compatibility with STLpy."""
+        raise NotImplementedError
+
+    def __hash__(self):
+        return hash(f"{self.cent},{self.size}")
+
+    def __eq__(self, other):
+        if not isinstance(other, RectangularPredicate):
+            return False
+        # return self.cent == other.cent and self.size == other.size
+        # Above using float difference
+        return np.allclose(self.cent, other.cent) and np.allclose(self.size, other.size)
+
+    def __str__(self) -> str:
+        return f"Goal {self.name}"
+
+    def __lt__(self, other: "RectangularPredicate") -> bool:
+        """Sort predicates by center (prioritizing y). To get consistent ordering."""
+        return (self.cent[1] < other.cent[1]) or (
+                np.allclose(self.cent[1], other.cent[1]) and self.cent[0] < other.cent[0])
+
+    def __rich_repr__(self):
+        # Assumes that size is common and not important
+        yield f"{self.cent}"
+
+
+# PREDICATE_FORM = TypeVar("PREDICATE_FORM", RectangularPredicate, PredicateBase)
+PREDICATE_TYPES = (RectangularPredicate, PredicateBase)
+SHRINK_NORM = 2  # Conservative norm used : 1 | 2 | jnp.inf
 
 import jax
 @jax.jit
@@ -72,35 +136,49 @@ except ImportError:
     print("architect-rss-22 not found")
     architect_stl = None
 
-class RectReachPredicate(PredicateBase):
+
+class RectReachPredicate(RectangularPredicate):
     """
     Rectangle reachability predicate
     """
 
-    def __init__(self, cent: np.ndarray, size: np.ndarray, name: str, shrink_factor: float = 0.5):
-        """
-        :param cent: center of the rectangle
-        :param size: bound of the rectangle
-        :param name: name of the predicate
-        """
-        super().__init__(name)
-        self.cent = cent
-        self.size = size
-
-        self.cent_tensor = ds_utils.default_tensor(cent)
-        self.size_tensor = ds_utils.default_tensor(size)
-        self.shrink_factor = shrink_factor  # shrink the rectangle to make it more conservative
-        self.logger.info(f"shrink factor: {shrink_factor}")
-
     def eval_whole_path(
-            self, path: jnp.array, start_t: int = 0, end_t: int = None
+            self, path: jnp.array, start_t: int = 0, end_t: int = None, train_mode: bool = False
     ) -> jnp.array:
         """Stick to JAX when possible."""
         assert len(path.shape) == 3, "motion must be in batch"
         eval_path = path[:, start_t:end_t]
-        res = jnp.min(
-            self.size_tensor / 2 - jnp.abs(eval_path - self.cent_tensor), axis=-1
-        )
+
+        def with_shrink(_eval_path):
+            """L-SHRINK_NORM Norm version for conservative evaluation"""
+            if SHRINK_NORM == 2:
+                # Multiply this factor to get an inner circle matching reach
+                shrink_multiplier = 1 / jnp.sqrt(2)
+            else:
+                shrink_multiplier = 1
+            return jnp.linalg.norm(self.size_tensor * self.shrink_factor * shrink_multiplier / 2,
+                                   ord=SHRINK_NORM) - jnp.linalg.norm(
+                _eval_path - self.cent_tensor, axis=-1, ord=SHRINK_NORM)
+            # # Adding shrink factor to make it more conservative
+            # # self.size_tensor * ( 0.2  / 2) - jnp.abs(_eval_path - self.cent_tensor), axis=-1
+            # # jnp.linalg.norm(self.size_tensor * 0.6 / 2) - jnp.linalg.norm(_eval_path - self.cent_tensor, axis=-1)
+            # axis=-1
+            # # (self.size_tensor * 0.7 / 2) ** 2 - jnp.square(_eval_path - self.cent_tensor), axis=-1
+
+            # jnp.min(
+            #     # Adding shrink factor to make it more conservative
+            #     self.size_tensor * ( 0.2  / 2) - jnp.abs(_eval_path - self.cent_tensor), axis=-1
+            #     # jnp.linalg.norm(self.size_tensor * 0.6 / 2) - jnp.linalg.norm(_eval_path - self.cent_tensor, axis=-1),
+            #     # axis=-1
+            #     # (self.size_tensor * 0.7 / 2) ** 2 - jnp.square(_eval_path - self.cent_tensor), axis=-1
+            # )
+
+        def without_shrink(_eval_path):
+            return jnp.min(
+                self.size_tensor / 2 - jnp.abs(_eval_path - self.cent_tensor), axis=-1
+            )
+
+        res = jax.lax.cond(train_mode, with_shrink, without_shrink, eval_path)
 
         return res
 
@@ -119,40 +197,43 @@ class RectReachPredicate(PredicateBase):
         # return inside_npy(bounds, 0, 1, 2, self.name)
 
 
-class RectAvoidPredicate(PredicateBase):
+class RectAvoidPredicate(RectangularPredicate):
     """
     Rectangle avoidance predicate
     """
 
-    def __init__(self, cent: np.ndarray, size: np.ndarray, name: str):
-        """
-        :param cent: center of the rectangle
-        :param size: bound of the rectangle
-        :param name: name of the predicate
-        """
-        super().__init__(name)
-        self.cent = cent
-        self.size = size
-
-        self.cent_tensor = ds_utils.default_tensor(cent)
-        self.size_tensor = ds_utils.default_tensor(size)
-
     def eval_whole_path(
-            self, path: jnp.array, start_t: int = 0, end_t: int = None
+            self, path: jnp.array, start_t: int = 0, end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
         """Stick to JAX when possible."""
         assert len(path.shape) == 3, "motion must be in batch"
         eval_path = path[:, start_t:end_t]
-        res = jnp.max(
-            jnp.abs(eval_path - self.cent_tensor) - self.size_tensor / 2, axis=-1
-        )
+
+        def with_shrink(_eval_path):
+            return jnp.max(
+                # Adding shrink factor to make it more conservative
+                jnp.square(_eval_path - self.cent_tensor) - (self.size_tensor * (2 - self.shrink_factor) / 2) ** 2,
+                axis=-1
+            )
+
+        def without_shrink(_eval_path):
+            return jnp.max(
+                # Adding shrink factor to make it more conservative
+                jnp.abs(eval_path - self.cent_tensor) - self.size_tensor / 2, axis=-1
+            )
+
+        res = jax.lax.cond(train_mode, with_shrink, without_shrink, eval_path)
 
         return res
+
+    def __str__(self) -> str:
+        return f"Obs {self.name}"
 
     def get_stlpy_form(self) -> STLTree:
         """Use Numpy to ensure compatibility with STLpy."""
         bounds = np.stack(
-            [self.cent - self.size / 2, self.cent + self.size / 2]
+            [self.cent - self.size * (2 - self.shrink_factor) / 2, self.cent + self.size * (2 - self.shrink_factor) / 2]
         ).T.flatten()
         return outside_npy(bounds, 0, 1, 2, self.name)
 
@@ -296,6 +377,34 @@ class LinearPredicate(baseLinearPredicate):
 
 AST = TypeVar("AST", list, PredicateBase)
 
+# ---------------------------------------------------------------------------------
+# OPERATOR MAPPINGS
+# ---------------------------------------------------------------------------------
+OP_SYMBOLS = {
+    "~": 0,  # NOT
+    "&": 1,  # AND
+    "|": 2,  # OR
+    "U": 3,  # UNTIL
+    "G": 4,  # ALWAYS
+    "F": 5,  # EVENTUALLY
+    "->": 6,  # IMPLIES
+}
+
+# For debugging or printing back the operator from the integer code
+OP_SYMBOLS_INV = {v: k for k, v in OP_SYMBOLS.items()}
+
+import functools as ft
+
+
+def list_to_tuple(x):
+    if isinstance(x, list):
+        return tuple(list_to_tuple(e) for e in x)
+    return x
+
+
+STATIC_ARGNUMS_UNARY = (0, 1, 3, 4, 5)
+STATIC_ARGNUMS_BINARY = (0, 1, 2, 4, 5, 6)
+
 
 class STL:
     """
@@ -305,49 +414,128 @@ class STL:
     """
 
     def __init__(self, ast: AST):
-        self.ast = ast
-        self.single_operators = ("~", "G", "F")
-        self.binary_operators = ("&", "|", "->", "U")
-        self.sequence_operators = ("G", "F", "U")
+        # self.ast = ast
+        single_operators = ("~", "G", "F")
+        binary_operators = ("&", "|", "->", "U")
+        sequence_operators = ("G", "F", "U")
+        self.single_operators = tuple(OP_SYMBOLS[op] for op in single_operators)
+        self.binary_operators = tuple(OP_SYMBOLS[op] for op in binary_operators)
+        self.sequence_operators = tuple(OP_SYMBOLS[op] for op in sequence_operators)
+        self.time_bounded_operators = self.sequence_operators
         self.stlpy_form = None
         self.expr_repr = None
         self.end_t = None  # Populated when evaluating
         self.logger = logging.getLogger(__name__)
+
+        # Recursively transform the user-provided AST so that any string operator
+        # is replaced by its numeric code.
+        self.ast = ast
+        self.tuple_ast = list_to_tuple(ast)
+
+    def _preprocess_ast(self, ast):
+        """Preprocess the AST like flattening AND/OR chains."""
+        raise NotImplementedError("Fill in the preprocessing logic to flatten AND/OR chains.")
+
+    def _transform_ast(self, node):
+        """Recursively walk the AST and replace any string operator with its numeric code."""
+        if self._is_leaf(node):
+            # Leaves (TaskBase, etc.) remain unchanged
+            return node
+
+        op = node[0]
+        # If operator is a string (like "G", "U", etc.) then map it to integer
+        if isinstance(op, str) and op in OP_SYMBOLS:
+            op_code = OP_SYMBOLS[op]
+
+            # Single-operator forms, e.g. NOT ("~")
+            if op_code == OP_SYMBOLS["~"]:
+                return [op_code, self._transform_ast(node[1])]
+
+            # Two-operand forms that also might have time windows:
+            # e.g. "G", "F" => shape: [ "G", sub_form, start, end ]
+            # e.g. "U" => [ "U", sub_form1, sub_form2, start, end ]
+            # e.g. "&", "|", "->" => [ op, sub_form1, sub_form2 ]
+            if op_code in (OP_SYMBOLS["G"], OP_SYMBOLS["F"]):
+                # time-bounded unary operator
+                return [
+                    op_code,
+                    self._transform_ast(node[1]),
+                    node[2],
+                    node[3],
+                ]
+            elif op_code == OP_SYMBOLS["U"]:
+                return [
+                    op_code,
+                    self._transform_ast(node[1]),
+                    self._transform_ast(node[2]),
+                    node[3],
+                    node[4],
+                ]
+            else:
+                # e.g. "&", "|", "->"
+                return [
+                    op_code,
+                    self._transform_ast(node[1]),
+                    self._transform_ast(node[2]),
+                ]
+        else:
+            # Possibly already transformed, or an unknown operator
+            # If it's a list of length >= 2, we still attempt recursion
+            if isinstance(node, list) or isinstance(node, tuple):
+                # Recursively transform each child that might be an operator
+                transformed_children = []
+                # The first element is either an already replaced op or something else
+                transformed_children.append(node[0])
+                for child in node[1:]:
+                    transformed_children.append(self._transform_ast(child))
+                return transformed_children
+
+        return node
 
     """
     Syntax Functions
     """
 
     def __and__(self, other: "STL") -> "STL":
-        ast = ["&", self.ast, other.ast]
+        ast = [OP_SYMBOLS["&"], self.ast, other.ast]
         return STL(ast)
 
     def __or__(self, other: "STL") -> "STL":
-        ast = ["|", self.ast, other.ast]
+        ast = [OP_SYMBOLS["|"], self.ast, other.ast]
         return STL(ast)
 
     def __invert__(self) -> "STL":
-        ast = ["~", self.ast]
+        ast = [OP_SYMBOLS["~"], self.ast]
         return STL(ast)
 
     def implies(self, other: "STL") -> "STL":
-        ast = ["->", self.ast, other.ast]
+        ast = [OP_SYMBOLS["->"], self.ast, other.ast]
         return STL(ast)
 
     def eventually(self, start: int, end: int):
-        ast = ["F", self.ast, start, end]
+        ast = [OP_SYMBOLS["F"], self.ast, start, end]
         return STL(ast)
 
     def always(self, start: int, end: int) -> "STL":
-        ast = ["G", self.ast, start, end]
+        ast = [OP_SYMBOLS["G"], self.ast, start, end]
         return STL(ast)
 
     def until(self, other: "STL", start: int, end: int) -> "STL":
-        ast = ["U", self.ast, other.ast, start, end]
+        ast = [OP_SYMBOLS["U"], self.ast, other.ast, start, end]
         return STL(ast)
 
-    def eval(self, path: jnp.array, t: int = 0) -> jnp.array:
-        return self._eval(self.ast, path, t)
+    def eval(self, path: jnp.array, t: int = 0, train_mode: bool = False) -> jnp.array:
+        """Evaluate the formula at time t.
+
+        :param path:            The motion path to evaluate the formula on.
+        :param train_mode:   Whether to evaluate in training mode (conservative with shrink factor).
+        :param t:               The time step to evaluate the formula at.
+        """
+        return self._eval(self.tuple_ast, path, t, train_mode=train_mode)
+
+    def eval_train(self, path: jnp.array, t: int = 0) -> jnp.array:
+        """To help prevent recompilation in jax.jit, we separate the training mode evaluation."""
+        return self.eval(path, t, train_mode=True)
 
     def end_time(self) -> int:
         """Get the end time of the formula efficiently."""
@@ -360,48 +548,78 @@ class STL:
     def _get_end_time(self, ast: AST) -> int:
         """Get max time of the formula. Runs in O(n) time where n is the number of nodes. Runs once then memoizes."""
         if self._is_leaf(ast):
-            return 1
-        if ast[0] == "G":
-            # Add end time from inner formula since always is unrolled
+            return 0
+        op = ast[0]
+        if op == OP_SYMBOLS["G"]:
+            # add end time from inner formula
             return ast[-1] + self._get_end_time(ast[1])
-        if ast[0] in self.sequence_operators:
+        elif op in self.sequence_operators:
             # The last two elements are the start and end times
             return ast[-1]
+        elif op == OP_SYMBOLS["~"]:
+            return self._get_end_time(ast[1])
         # Is binary operator
         return max(self._get_end_time(ast[1]), self._get_end_time(ast[2]))
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval(
-            self, ast: AST, path: jnp.array, start_t: int = 0, end_t: int = None
+            self,
+            ast: AST,
+            path: jnp.array,
+            start_t: int = 0,
+            end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
         if self._is_leaf(ast):
-            return ast.eval_at_t(path, start_t)
+            return ast.eval_at_t(path, start_t, train_mode=train_mode)
 
-        if ast[0] in self.sequence_operators:
+        op_code = ast[0]
+        if op_code in self.sequence_operators:
             # NOTE: Overwrite start_t and end_t
-            # this will allow access the elements after previous end_t
             start_t, end_t = start_t + ast[-2], start_t + ast[-1]
             if end_t > path.shape[1]:
                 self.logger.warning("end_t is larger than motion length")
 
-        if ast[0] == "&":
-            res = self._eval_and(ast[1], ast[2], path, start_t, end_t)
-        elif ast[0] == "|":
-            res = self._eval_or(ast[1], ast[2], path, start_t, end_t)
-        elif ast[0] == "~":
-            res = self._eval_not(ast[1], path, start_t, end_t)
-        elif ast[0] == "->":
-            res = self._eval_implies(ast[1], ast[2], path, start_t, end_t)
-        elif ast[0] == "G":
-            res = self._eval_always(ast[1], path, start_t, end_t)
-        elif ast[0] == "F":
-            res = self._eval_eventually(ast[1], path, start_t, end_t)
-        elif ast[0] == "U":
-            res = self._eval_until(ast[1], ast[2], path, start_t, end_t)
-        else:
-            raise ValueError(f"Unknown operator {ast[0]}")
+        if op_code == OP_SYMBOLS["&"]:
+            return self._eval_and(ast[1], ast[2], path, start_t, end_t, train_mode=train_mode)
+        elif op_code == OP_SYMBOLS["|"]:
+            return self._eval_or(ast[1], ast[2], path, start_t, end_t, train_mode=train_mode)
+        elif op_code == OP_SYMBOLS["~"]:
+            return self._eval_not(ast[1], path, start_t, end_t, train_mode=train_mode)
+        elif op_code == OP_SYMBOLS["->"]:
+            return self._eval_implies(ast[1], ast[2], path, start_t, end_t, train_mode=train_mode)
+        elif op_code == OP_SYMBOLS["G"]:
+            return self._eval_always(ast[1], path, start_t, end_t, train_mode=train_mode)
+        elif op_code == OP_SYMBOLS["F"]:
+            return self._eval_eventually(ast[1], path, start_t, end_t, train_mode=train_mode)
+        elif op_code == OP_SYMBOLS["U"]:
+            return self._eval_until(ast[1], ast[2], path, start_t, end_t, train_mode=train_mode)
 
-        return res
+        raise ValueError(f"Unknown operator {ast[0]}")
 
+    def _flatten_and_or(self, cast: AST, flat_and=True) -> list[AST]:
+        """
+        Recursively collect every subformula under an & chain into a single list.
+        For example, if cast = ['&', A, ['&', B, C]], then
+        _flatten_and(cast) = [A, B, C].
+        """
+        # If it's not an AND node, just return it as a single-element list.
+        stack = [cast]
+        result = []
+        target_code = OP_SYMBOLS["&"] if flat_and else OP_SYMBOLS["|"]
+        while stack:
+            node = stack.pop()
+            if (isinstance(node, list) or isinstance(node, tuple)) and node[0] == target_code:
+                # node is of the form: ['&', left, right] or ['|', left, right]
+                # push its children on the stack
+                stack.append(node[2])
+                stack.append(node[1])
+            else:
+                # leaf node (predicate) or non-& \ non-| node
+                result.append(node)
+        return result
+
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_and(
             self,
             sub_form1: AST,
@@ -409,18 +627,38 @@ class STL:
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
-        return self._tensor_min(
-            jnp.stack(
-                [
-                    self._eval(sub_form1, path, start_t, end_t),
-                    self._eval(sub_form2, path, start_t, end_t),
-                ],
-                axis=-1,
-            ),
-            axis=-1,
-        )
+        def regular_and(_sub_form1, _sub_form2, _path, _start_t, _end_t):
+            _train_mode = False
+            subforms = self._flatten_and_or([OP_SYMBOLS["&"], _sub_form1, _sub_form2], flat_and=True)
 
+            # 2. Evaluate each subformula
+            vals = [
+                self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode)
+                for subf in subforms
+            ]
+
+            # 3. Stack and do a single min (or your exponential scheme)
+            stacked = jnp.stack(vals, axis=-1)
+            return self._tensor_min(stacked, axis=-1)
+
+        def pairwise_and(_sub_form1, _sub_form2, _path, _start_t, _end_t):
+            """This can cause  brittle or localized gradient."""
+            return self._tensor_min(
+                jnp.stack(
+                    [
+                        self._eval(_sub_form1, _path, _start_t, _end_t),
+                        self._eval(_sub_form2, _path, _start_t, _end_t),
+                    ],
+                    axis=-1,
+                ),
+                axis=-1,
+            )
+
+        return regular_and(sub_form1, sub_form2, path, start_t, end_t)
+
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_or(
             self,
             sub_form1: AST,
@@ -428,21 +666,48 @@ class STL:
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
-        return self._tensor_max(
-            jnp.stack(
-                [
-                    self._eval(sub_form1, path, start_t, end_t),
-                    self._eval(sub_form2, path, start_t, end_t),
-                ],
+        def regular_or(_sub_form1, _sub_form2, _path, _start_t, _end_t, _train_mode):
+            subforms = self._flatten_and_or([OP_SYMBOLS["|"], sub_form1, sub_form2], flat_and=False)
+
+            # 2. Evaluate each subformula
+            vals = [
+                self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode)
+                for subf in subforms
+            ]
+
+            # 3. Stack and do a single min (or your exponential scheme)
+            stacked = jnp.stack(vals, axis=-1)
+            return self._tensor_max(stacked, axis=-1)
+
+        def pairwise_or(_sub_form1, _sub_form2, _path, _start_t, _end_t):
+            """This can cause  brittle or localized gradient."""
+            return self._tensor_max(
+                jnp.stack(
+                    [
+                        self._eval(_sub_form1, _path, _start_t, _end_t),
+                        self._eval(_sub_form2, _path, _start_t, _end_t),
+                    ],
+                    axis=-1,
+                ),
                 axis=-1,
-            ),
-            axis=-1,
-        )
+            )
 
-    def _eval_not(self, ast: AST, path: jnp.array, start_t: int, end_t: int) -> jnp.array:
-        return -self._eval(ast, path, start_t, end_t)
+        return regular_or(sub_form1, sub_form2, path, start_t, end_t, train_mode)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
+    def _eval_not(
+            self,
+            ast: AST,
+            path: jnp.array,
+            start_t: int,
+            end_t: int,
+            train_mode: bool = False
+    ) -> jnp.array:
+        return -self._eval(ast, path, start_t, end_t, train_mode=train_mode)
+
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_implies(
             self,
             sub_form1: AST,
@@ -450,25 +715,36 @@ class STL:
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
         if IMPLIES_TRICK:
-            return self._eval(sub_form1, path, start_t, end_t) * self._eval(
-                sub_form2, path, start_t, end_t
+            return (
+                    self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode)
+                    * self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode)
             )
-        return self._eval_or(["~", sub_form1], sub_form2, path, start_t, end_t)
+        return self._eval_or(
+            [OP_SYMBOLS["~"], sub_form1], sub_form2, path, start_t, end_t, train_mode=train_mode
+        )
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval_always(
-            self, sub_form: AST, path: jnp.array, start_t: int, end_t: int
+            self,
+            sub_form: AST,
+            path: jnp.array,
+            start_t: int,
+            end_t: int,
+            train_mode: bool = False
     ) -> jnp.array:
         if self._is_leaf(sub_form):
             return self._tensor_min(
-                sub_form.eval_whole_path(path[:, start_t:end_t]), axis=-1
+                sub_form.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode),
+                axis=-1
             )
 
         # unroll always
         val_per_time = jnp.stack(
             [
-                self._eval(sub_form, path, start_t=start_t + t, end_t=end_t)
+                self._eval(sub_form, path, start_t=start_t + t, end_t=end_t, train_mode=train_mode)
                 for t in range(end_t - start_t)
             ],
             axis=-1,
@@ -476,18 +752,25 @@ class STL:
 
         return self._tensor_min(val_per_time, axis=-1)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval_eventually(
-            self, sub_form: AST, path: jnp.array, start_t: int = 0, end_t: int = None
+            self,
+            sub_form: AST,
+            path: jnp.array,
+            start_t: int = 0,
+            end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
         if self._is_leaf(sub_form):
             return self._tensor_max(
-                sub_form.eval_whole_path(path[:, start_t:end_t]), axis=-1
+                sub_form.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode),
+                axis=-1
             )
 
         # unroll eventually
         val_per_time = jnp.stack(
             [
-                self._eval(sub_form, path, start_t=start_t + t, end_t=end_t)
+                self._eval(sub_form, path, start_t=start_t + t, end_t=end_t, train_mode=train_mode)
                 for t in range(end_t - start_t)
             ],
             axis=-1,
@@ -495,6 +778,7 @@ class STL:
 
         return self._tensor_max(val_per_time, axis=-1)
 
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_until(
             self,
             sub_form1: AST,
@@ -502,49 +786,43 @@ class STL:
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
+            train_mode: bool = False
     ) -> jnp.array:
         if self._is_leaf(sub_form2):
-            till_pred = sub_form2.eval_whole_path(path[:, start_t:end_t])
+            till_pred = sub_form2.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode)
         else:
             till_pred = jnp.stack(
                 [
-                    self._eval(sub_form2, path, start_t=t, end_t=end_t)
+                    self._eval(sub_form2, path, start_t=t, end_t=end_t, train_mode=train_mode)
                     for t in range(end_t - start_t)
                 ],
                 axis=-1,
             )
-        # mask condition, once condition > 0 (after until True),
-        # the right sequence is no longer considered
+
+        # mask condition...
         cond = (till_pred > 0).astype(int)
         index = jnp.argmax(cond, axis=-1)
-
         batch_size, seq_len = cond.shape
         row_indices = jnp.arange(batch_size)[:, None]
         col_indices = jnp.arange(seq_len)
-
         mask = col_indices >= index[:, None]
+        cond = ~mask.astype(bool)
 
-        # Apply the mask
-        cond = mask.astype(int)
-        cond = ~cond.astype(bool)
-
-        # for i in range(cond.shape[0]):
-        #     cond[i, index[i]:] = 1.0
-        # cond = ~cond.astype(bool)
+        # Set true values after 'till' is satisfied
         till_pred = jnp.where(cond, till_pred, ds_utils.default_tensor(1))
 
         if self._is_leaf(sub_form1):
-            res = sub_form1.eval_whole_path(path[:, start_t:end_t])
+            res = sub_form1.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode)
         else:
             res = jnp.stack(
                 [
-                    self._eval(sub_form1, path, start_t=t, end_t=end_t)
+                    self._eval(sub_form1, path, start_t=t, end_t=end_t, train_mode=train_mode)
                     for t in range(end_t - start_t)
                 ],
                 axis=-1,
             )
-        res = jnp.where(cond, res, ds_utils.default_tensor(-1))
 
+        res = jnp.where(cond, res, ds_utils.default_tensor(-1))
         # when cond < 0, res should always > 0 to be hold
         return self._tensor_min(-res * till_pred, axis=-1)
 
@@ -561,19 +839,19 @@ class STL:
             self.stlpy_form = ast.get_stlpy_form()
             return self.stlpy_form
 
-        if ast[0] == "~":
+        if ast[0] == OP_SYMBOLS["~"]:
             self.stlpy_form = self._convert_not(ast)
-        elif ast[0] == "G":
+        elif ast[0] == OP_SYMBOLS["G"]:
             self.stlpy_form = self._convert_always(ast)
-        elif ast[0] == "F":
+        elif ast[0] == OP_SYMBOLS["F"]:
             self.stlpy_form = self._convert_eventually(ast)
-        elif ast[0] == "&":
+        elif ast[0] == OP_SYMBOLS["&"]:
             self.stlpy_form = self._convert_and(ast)
-        elif ast[0] == "|":
+        elif ast[0] == OP_SYMBOLS["|"]:
             self.stlpy_form = self._convert_or(ast)
-        elif ast[0] == "->":
+        elif ast[0] == OP_SYMBOLS["->"]:
             self.stlpy_form = self._convert_implies(ast)
-        elif ast[0] == "U":
+        elif ast[0] == OP_SYMBOLS["U"]:
             self.stlpy_form = self._convert_until(ast)
         else:
             raise ValueError(f"Unknown operator {ast[0]}")
@@ -614,6 +892,10 @@ class STL:
 
     @staticmethod
     def _is_leaf(ast: AST):
+        # Check is type PREDICATE_FORM
+        for pred_type in PREDICATE_TYPES:
+            if isinstance(ast, pred_type):
+                return True
         return issubclass(type(ast), PredicateBase)
 
     def _tensor_min(self, tensor: jnp.array, axis=-1) -> jnp.array:
@@ -633,17 +915,19 @@ class STL:
         if self.expr_repr is not None:
             return self.expr_repr
 
-        single_operators = ("~", "G", "F")
-        binary_operators = ("&", "|", "->", "U")
-        time_bounded_operators = ("G", "F", "U")
+        expr = self._extract_repr()
 
+        self.expr_repr = expr
+        return expr
+
+    def _extract_repr(self, print_rich=False):
         # traverse ast
         operator_stack = [self.ast]
         expr = ""
         cur = self.ast
 
         def push_stack(ast):
-            if isinstance(ast, str) and ast in time_bounded_operators:
+            if isinstance(ast, int) and ast in self.time_bounded_operators:
                 time_window = f"[{cur[-2]}, {cur[-1]}]"
                 operator_stack.append(time_window)
             operator_stack.append(ast)
@@ -651,25 +935,23 @@ class STL:
         while operator_stack:
             cur = operator_stack.pop()
             if self._is_leaf(cur):
-                expr += cur.__str__()
+                if print_rich:
+                    expr += f"({str(next(cur.__rich_repr__()))})"
+                else:
+                    expr += cur.__str__()
             elif isinstance(cur, str):
                 if cur == "(" or cur == ")":
                     expr += cur
                 elif cur.startswith("["):
                     expr += colored(cur, "yellow") + " "
-                else:
-                    if cur in ("G", "F"):
-                        if cur == "F":
-                            expr += colored("F", "magenta")
-                        else:
-                            expr += colored(cur, "magenta")
-                    elif cur in ("&", "|", "->", "U"):
-                        expr += " " + colored(cur, "magenta")
-                        if cur != "U":
-                            expr += " "
-                    elif cur in ("~",):
-                        expr += colored(cur, "magenta")
-            elif cur[0] in single_operators:
+            elif isinstance(cur, int):
+                if cur in (OP_SYMBOLS["G"], OP_SYMBOLS["F"], OP_SYMBOLS["~"]):
+                    expr += colored(OP_SYMBOLS_INV[cur], "magenta")
+                elif cur in (OP_SYMBOLS["&"], OP_SYMBOLS["|"], OP_SYMBOLS["->"], OP_SYMBOLS["U"]):
+                    expr += " " + colored(OP_SYMBOLS_INV[cur], "magenta")
+                    if cur != OP_SYMBOLS["U"]:
+                        expr += " "
+            elif cur[0] in self.single_operators:
                 # single operator
                 if not self._is_leaf(cur[1]):
                     push_stack(")")
@@ -677,27 +959,26 @@ class STL:
                 if not self._is_leaf(cur[1]):
                     push_stack("(")
                 push_stack(cur[0])
-            elif cur[0] in binary_operators:
+            elif cur[0] in self.binary_operators:
                 # binary operator
-                if not self._is_leaf(cur[2]) and cur[2][0] in binary_operators:
+                if not self._is_leaf(cur[2]) and cur[2][0] in self.binary_operators:
                     push_stack(")")
                     push_stack(cur[2])
                     push_stack("(")
                 else:
                     push_stack(cur[2])
                 push_stack(cur[0])
-                if not self._is_leaf(cur[1]) and cur[1][0] in binary_operators:
+                if not self._is_leaf(cur[1]) and cur[1][0] in self.binary_operators:
                     push_stack(")")
                     push_stack(cur[1])
                     push_stack("(")
                 else:
                     push_stack(cur[1])
-
-        self.expr_repr = expr
         return expr
 
     def latex_repr(self):
         repr = self.__repr__()
+
         def replace_special_chars(match):
             return {
                 "~": r"\neg",
@@ -708,6 +989,7 @@ class STL:
                 "F": r"\Diamond",
                 "U": r"U",
             }[match.group(0)]
+
         replaced_symb = re.sub(r"~|&|\||->|G|F|U", replace_special_chars, repr)
         # replace any [a, b] with _{[a,b]}
         replaced_symb = re.sub(r"\[(\d+), (\d+)\]", r"_{[\1,\2]}", replaced_symb)
@@ -733,3 +1015,26 @@ class STL:
                 raise RuntimeError("Should never visit here")
 
         return all_preds
+
+# TODO: Properly register if needed for use with JAX
+
+# # Register PredicateBase as a PyTree
+# jtu.register_pytree_node(
+#     PredicateBase,
+#     lambda pred: ((), (pred.name,)),  # Flatten: no JAX-tracked fields, only auxiliary data
+#     lambda aux, _: PredicateBase(aux[0])  # Unflatten
+# )
+#
+# # Register RectangularPredicate as a PyTree
+# jtu.register_pytree_node(
+#     RectangularPredicate,
+#     lambda pred: ((pred.cent, pred.size), (pred.name, pred.shrink_factor)),  # Flatten
+#     lambda aux, children: RectangularPredicate(children[0], children[1], aux[0], aux[1])  # Unflatten
+# )
+#
+# # Register STL as a PyTree
+# jtu.register_pytree_node(
+#     STL,
+#     lambda stl: ((stl.ast,), ()),  # Flatten: AST (JAX-tracked), no auxiliary data
+#     lambda aux, children: STL(children[0])  # Unflatten
+# )

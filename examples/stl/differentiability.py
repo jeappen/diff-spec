@@ -1,10 +1,10 @@
 # %%
+import importlib
 import os
 
 import matplotlib.pyplot as plt
 import numpy as np
 import optax
-import importlib
 
 import ds.utils as ds_utils
 
@@ -12,11 +12,13 @@ import ds.utils as ds_utils
 if os.environ.get("DIFF_STL_BACKEND") == "jax":
     print("Using JAX backend")
     from ds.stl_jax import STL, RectAvoidPredicate, RectReachPredicate
+
     importlib.reload(ds_utils)  # Reload the module to reset the backend
     import jax
 else:
     print("Using PyTorch backend")
     from ds.stl import STL, RectAvoidPredicate, RectReachPredicate
+
     importlib.reload(ds_utils)  # Reload the module to reset the backend
     import torch
     from torch.optim import Adam
@@ -69,24 +71,39 @@ def eval_reach_avoid(mute=False):
                     [1, 1],
                     [1, 1],
                 ],
+                [
+                    [9, 9],
+                    [3, 2],
+                    [7, 7],
+                    [6, 6],
+                    [5, 5],
+                    [4, 4],
+                    [3, 3],
+                    [2, 2],
+                    [1, 1],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ]
             ]
         )
     )
 
     # eval the formula, default at time 0
-    res1 = form.eval(path=path_1)
+    res1 = form.eval(path=path_1)  # (+,-,-)
     if not mute:
         print("eval result at time 0: ", res1)
 
     # eval the formula at time 2
-    res2 = form.eval(path=path_1, t=2)
+    res2 = form.eval(path=path_1, t=2)  # (+,-,+)
     if not mute:
         print("eval result at time 2: ", res2)
 
     return res1, res2
 
 
-def backward(mute=True):
+def backward(jax_key=None, avoid_spec=False, mute=True):
     """
     Planning with gradient descent
     """
@@ -95,47 +112,69 @@ def backward(mute=True):
     # goal_1 is a rectangle area centered in [0, 0] with width and height 1
     goal_1 = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1]), "goal_1"))
     # goal_2 is a rectangle area centered in [2, 2] with width and height 1
-    goal_2 = STL(RectReachPredicate(np.array([2, 2]), np.array([1, 1]), "goal_2"))
+    goal_2 = STL(RectReachPredicate(np.array([3, 3]), np.array([1, 1]), "goal_2"))
+    # goal_2 is a rectangle area centered in [1, 1] with width and height 1
+    avoid_region = STL(RectAvoidPredicate(np.array([1, 1]), np.array([1, 1]), "avoid_region"))
+    avoid_region2 = STL(RectAvoidPredicate(np.array([2, 2]), np.array([1, 1]), "avoid_region2"))
+    avoid_region_goal1 = STL(RectAvoidPredicate(np.array([0, 0]), np.array([1, 1]), "avoid_region_goal1"))
+    avoid_region_goal2 = STL(RectAvoidPredicate(np.array([3, 3]), np.array([1, 1]), "avoid_region_goal2"))
+    end_time = 13
 
-    # form is the formula goal_1 eventually in 0 to 5 and goal_2 eventually in 0 to 5
-    # and that holds always in 0 to 8
-    # In other words, the path will repeatedly visit goal_1 and goal_2 in 0 to 13
-    form = (goal_1.eventually(0, 5) & goal_2.eventually(0, 5)).always(0, 8)
-    path = ds_utils.default_tensor(
-        np.array(
+    if avoid_spec:
+        print("cover while avoiding avoid_region")
+        # NOTE: Cover different just alternates between goal_1 and goal_2
+        form = goal_2.eventually(0, end_time) & goal_1.eventually(0, end_time) \
+               & avoid_region.always(0, end_time) & avoid_region2.always(0, end_time) \
+               & avoid_region_goal1.always(end_time // 2, end_time) & avoid_region_goal2.always(0, end_time // 2)
+    else:
+        # form is the formula goal_1 eventually in 0 to 5 and goal_2 eventually in 0 to 5
+        # and that holds always in 0 to 8
+        # In other words, the path will repeatedly visit goal_1 and goal_2 in 0 to 13
+        form = (goal_1.eventually(0, 5) & goal_2.eventually(0, 5)).always(0, 8)
+
+    np_path = np.array(
+        [
             [
-                [
-                    [1, 0],
-                    [1, 0],
-                    [1, 0],
-                    [1, 0],
-                    [0, 1],
-                    [0, 1],
-                    [0, 1],
-                    [0, 1],
-                    [0, 1],
-                    [0, 1],
-                    [0, 1],
-                    [0, 1],
-                    [1, 0],
-                    [1, 0],
-                ],
-            ]
-        )
+                [1, 0],
+                [1, 0],
+                [1, 0],
+                [1, 0],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [1, 0],
+                [1, 0],
+            ],
+        ]
     )
+
     loss = None
     lr = 0.1
     num_iterations = 1000
 
     if os.environ.get("DIFF_STL_BACKEND") == "jax":
 
+        if jax_key is None:
+            jax_key = jax.random.PRNGKey(0)
+
+        random_like = jax.random.normal(jax_key, np_path.shape)
+        path = ds_utils.default_tensor(random_like)
+
         solver = optax.adam(lr)
         var_solver_state = solver.init(path)
+
+        stl_form_eval_train = lambda x: -form.eval(x, train_mode=True).mean()
+        stl_form_eval_test = lambda x: -form.eval(x).mean()
 
         @jax.jit
         def train_step(params, solver_state):
             # Performs a one step update.
-            (loss), grad = jax.value_and_grad(lambda x : -form.eval(x).mean())(
+            (loss), grad = jax.value_and_grad(stl_form_eval_train)(
                 params
             )
             updates, solver_state = solver.update(grad, solver_state)
@@ -147,14 +186,107 @@ def backward(mute=True):
                 path, var_solver_state
             )
 
-        loss = form.eval(path)
+        loss = stl_form_eval_test(path)
     else:
+
+        random_like = np.random.rand(*np_path.shape)
+        path = ds_utils.default_tensor(random_like)
         # PyTorch backend (slower when num_iterations is high)
         path.requires_grad = True
         opt = Adam(params=[path], lr=lr)
 
+        # ds_utils.HARDNESS = 3.0
+
         for _ in range(num_iterations):
             loss = -torch.mean(form.eval(path))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+        if not mute:
+            print(f"final loss: {loss.item()}")
+            print(path)
+
+            plt.plot(path[0, :, 0].numpy(force=True), path[0, :, 1].numpy(force=True))
+            plt.show()
+
+    return path, loss
+
+
+def mabackward(jax_key=None, ma_stl_spec=None, avoid_spec=False, mute=True):
+    """
+    Planning with gradient descent
+    """
+
+    assert ma_stl_spec is not None
+
+    np_path = np.array(
+        [
+            [
+                [1, 0],
+                [1, 0],
+                [1, 0],
+                [1, 0],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [0, 1],
+                [1, 0],
+                [1, 0],
+            ],
+        ]
+    )
+
+    loss = None
+    lr = 0.1
+    num_iterations = 1000
+    num_agents = 8
+
+    if os.environ.get("DIFF_STL_BACKEND") == "jax":
+
+        if jax_key is None:
+            jax_key = jax.random.PRNGKey(0)
+        random_like = jax.random.normal(jax_key, (num_agents,) + np_path[0].shape)
+        path = ds_utils.default_tensor(random_like)
+
+        solver = optax.adam(lr)
+        var_solver_state = solver.init(path)
+
+        stl_form_eval_train = lambda x: -ma_stl_spec.eval(x, train_mode=True).mean()
+        stl_form_eval_test = lambda x: -ma_stl_spec.eval(x).mean()
+
+        @jax.jit
+        def train_step(carry, _):
+            # Performs a one step update.
+            params, solver_state = carry
+            (loss), grad = jax.value_and_grad(stl_form_eval_train)(
+                params
+            )
+            updates, solver_state = solver.update(grad, solver_state)
+            params = optax.apply_updates(params, updates)
+            return (params, solver_state), loss
+
+        # Above using jax.lax.scan
+        (path, var_solver_state), train_losses = jax.lax.scan(train_step, (path, var_solver_state),
+                                                              length=num_iterations)
+
+        loss = stl_form_eval_test(path)
+    else:
+
+        random_like = np.random.rand(*((num_agents,) + np_path[0].shape))
+        path = ds_utils.default_tensor(random_like)
+        # PyTorch backend (slower when num_iterations is high)
+        path.requires_grad = True
+        opt = Adam(params=[path], lr=lr)
+
+        # ds_utils.HARDNESS = 3.0
+
+        for _ in range(num_iterations):
+            loss = -torch.mean(ma_stl_spec.eval(path))
             opt.zero_grad()
             loss.backward()
             opt.step()

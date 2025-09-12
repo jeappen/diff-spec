@@ -1,13 +1,14 @@
 import importlib
-import os
-import unittest
-
 import numpy as np
+import os
+import torch
+import unittest
 
 import ds.utils as ds_utils
 import examples.stl.differentiability as stl_diff_examples
 from ds.stl import STL, RectReachPredicate
 
+TEST_TOLERANCE = 1e-3  # Small number close to 0
 
 class TestExamples(unittest.TestCase):
 
@@ -23,15 +24,21 @@ class TestExamples(unittest.TestCase):
             # Fair test with jax
             res = stl_diff_examples.eval_reach_avoid(mute=True)
             final_result.append(res)
+            # Match expected output
+            assert ((res[0] > 0) == torch.tensor([True, False, False])).all()
+            assert ((res[1] > 0) == torch.tensor([True, False, True])).all()
 
-        print(final_result)
+        # print(final_result)
 
         # Test differentiability
-        path = stl_diff_examples.backward()
-        print(path)
+        path, loss = stl_diff_examples.backward()
+        print('Path', path)
+        assert loss < TEST_TOLERANCE  # Loss should be less than 0 to satisfy the formula
 
-        #
-        # self.assertEqual(True, False)  # add assertion here
+    def test_avoid_backward(self):
+        path, loss = stl_diff_examples.backward(avoid_spec=True)
+        print('AvoidPath', loss, path)
+        assert loss < TEST_TOLERANCE  # Loss should be less than 0 to satisfy the formula
 
     def test_evaluations(self, num_tiles=3):
         """Run simple evaluations to test shapes and types"""

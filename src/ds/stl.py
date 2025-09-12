@@ -1,18 +1,18 @@
-import io
-import time
-from abc import abstractmethod
 from collections import deque
-from contextlib import redirect_stdout
-from typing import TypeVar, Tuple
 
 import gurobipy as gp
+import io
 import numpy as np
+import time
 import torch
+from abc import abstractmethod
+from contextlib import redirect_stdout
 from gurobipy import GRB
 from stlpy.STL import LinearPredicate, NonlinearPredicate, STLTree
 from stlpy.systems import LinearSystem
 from torch import Tensor
 from torch.nn.functional import softmax
+from typing import TypeVar, Tuple
 
 from ds.utils import default_tensor, colored, HARDNESS, IMPLIES_TRICK, outside_rectangle_formula, \
     inside_rectangle_formula
@@ -386,6 +386,11 @@ class RectReachPredicate(PredicateBase):
     ) -> Tensor:
         assert len(path.shape) == 3, "motion must be in batch"
         eval_path = path[:, start_t:end_t]
+        # NOTE: This is the soft version of the predicate
+        # res_soft = STL(None)._tensor_min(
+        #     self.size_tensor / 2 - torch.abs(eval_path - self.cent_tensor), dim=-1
+        # )
+
         res = torch.min(
             self.size_tensor / 2 - torch.abs(eval_path - self.cent_tensor), dim=-1
         )[0]

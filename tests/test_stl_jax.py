@@ -3,6 +3,7 @@ import os
 import unittest
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax import jit
 
@@ -13,6 +14,12 @@ import examples.stl.differentiability as stl_diff_examples
 from ds.stl_jax import STL, RectReachPredicate
 
 from ds.stl import StlpySolver
+
+# LARGE_TEST_TOLERANCE shouldn't be too small since avoid_backward sometimes fails
+LARGE_TEST_TOLERANCE = 2e-2  # Smallish number close to 0
+TEST_TOLERANCE = 1e-3  # Small number close to 0
+
+
 class TestJAXExamples(unittest.TestCase):
 
     def setUp(self):
@@ -20,9 +27,11 @@ class TestJAXExamples(unittest.TestCase):
         importlib.reload(stl_diff_examples)  # Reload the module to reset the backend
         importlib.reload(ds_utils)  # Reload the module to reset the backend
 
-        self.goal_1 = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1]), "goal_1"))
+        self.key = jax.random.PRNGKey(0)
+
+        self.goal_1 = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1]), 1))
         # goal_2 is a rectangle area centered in [2, 2] with width and height 1
-        self.goal_2 = STL(RectReachPredicate(np.array([2, 2]), np.array([1, 1]), "goal_2"))
+        self.goal_2 = STL(RectReachPredicate(np.array([2, 2]), np.array([1, 1]), 2))
 
         # form is the formula goal_1 eventually in 0 to 5 and goal_2 eventually in 0 to 5
         # and that holds always in 0 to 8
@@ -31,6 +40,13 @@ class TestJAXExamples(unittest.TestCase):
         self.loop_form = (self.goal_1.eventually(0, 4) & self.goal_2.eventually(0, 4)).always(0, 8)
         self.cover_form = self.goal_1.eventually(0, 12) & self.goal_2.eventually(0, 12)
         self.seq_form = self.goal_1.eventually(0, 6) & self.goal_2.eventually(6, 12)
+
+        self.all_forms = [self.form, self.loop_form, self.cover_form, self.seq_form]
+
+    def test_repr(self):
+        print(self.form)
+        for form in self.all_forms:
+            print(form)
 
     def test_run(self):
         # TODO: Study jit decorator and see optimizations
@@ -41,17 +57,36 @@ class TestJAXExamples(unittest.TestCase):
             # Magic of jax
             res = jit(stl_diff_examples.eval_reach_avoid)()
             final_result.append(res)
+            # Match expected output
+            assert jnp.all((res[0] > 0) == jnp.array([True, False, False]))
+            assert jnp.all((res[1] > 0) == jnp.array([True, False, True]))
 
         print(final_result)
 
         # Test differentiability
-        path = stl_diff_examples.backward()
-        print(path)
+        path, loss = stl_diff_examples.backward()
+        print('Path', path)
+        assert loss < TEST_TOLERANCE  # Loss should be less than 0 to satisfy the formula
         # (jax.lax.fori_loop(0, 1000, lambda i, _: jit(eval_reach_avoid)(), None)).block_until_ready()
         # for _ in range(1000):
         #     eval_reach_avoid()
         #
         # self.assertEqual(True, False)  # add assertion here
+
+    def test_avoid_backward(self):
+
+        def avoid_test(_key):
+            path, loss = stl_diff_examples.backward(_key, avoid_spec=True)
+            return path, loss
+
+        num_tests = 50
+        keys = jax.random.split(self.key, num_tests)
+        paths, losses = jax.vmap(avoid_test)(keys)
+
+        print('AvoidPath', losses[0], paths[0])
+        print(f"Unsatisfied losses {sum(losses > TEST_TOLERANCE)} out of {num_tests}")
+        print(f"Max loss {jnp.max(losses)}")
+        assert (losses < LARGE_TEST_TOLERANCE).all()  # Loss should be less than 0 to satisfy the formula
 
     def test_evaluations(self, num_tiles=3):
         """Run simple evaluations to test shapes and types"""
@@ -108,16 +143,16 @@ class TestJAXExamples(unittest.TestCase):
         """Test the stlpy solver with different forms of STL formulas"""
         x_0 = np.array([0, 0])
         solver = StlpySolver(space_dim=2)
-        total_time = 12 # Common total time for all formulas
+        total_time = 12  # Common total time for all formulas
 
         for form in [self.loop_form, self.cover_form, self.seq_form]:
-
             stlpy_form = form.get_stlpy_form()
             path, info = solver.solve_stlpy_formula(stlpy_form, x0=x_0, total_time=total_time)
 
             num_tiles = 4
             loss = form.eval(jax.numpy.tile(path, (num_tiles, 1, 1)))  # Make a batch of size num_tiles
             self.assertGreater(loss[0], 0, f"STLPY solved path loss is not greater than 0 for {form}")
+
 
 if __name__ == '__main__':
     unittest.main()

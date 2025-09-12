@@ -5,7 +5,7 @@ Connect differentiable components with logical operators.
 ## Install
 
 ```bash
-pip install git+https://github.com/ZikangXiong/diff-spec.git
+pip install git+https://github.com/jeappen/diff-spec.git@feature/jax
 ```
 
 ## First Order Logic
