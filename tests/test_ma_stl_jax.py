@@ -22,6 +22,8 @@ class TestMASTLJAXExamples(unittest.TestCase):
         os.environ["DIFF_STL_BACKEND"] = "jax"  # set the backend to JAX for all child processes
         importlib.reload(ds_utils)  # Reload the module to reset the backend
 
+        self.key = jax.random.PRNGKey(0)
+
         self.goal_1 = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1]), "goal_1"))
         # goal_2 is a rectangle area centered in [2, 2] with width and height 1
         self.goal_2 = STL(RectReachPredicate(np.array([2, 2]), np.array([1, 1]), "goal_2"))
@@ -232,12 +234,12 @@ class TestMASTLJAXExamples(unittest.TestCase):
 
         # Test differentiability
         for catl_form in self.all_catl_forms:
-            path, loss = stl_diff_examples.mabackward(ma_stl_spec=catl_form)
+            path, loss = stl_diff_examples.mabackward(jax_key=self.key, ma_stl_spec=catl_form)
             print('loss', loss)
             assert loss < TEST_TOLERANCE  # Loss should be less than 0 to satisfy the formula
 
     def _test_avoid_backward(self):
-        path, loss = stl_diff_examples.backward(avoid_spec=True)
+        path, loss = stl_diff_examples.backward(self.key, avoid_spec=True)
         print('AvoidPath', loss, path)
         assert loss < TEST_TOLERANCE  # Loss should be less than 0 to satisfy the formula
 

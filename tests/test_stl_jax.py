@@ -64,7 +64,7 @@ class TestJAXExamples(unittest.TestCase):
         print(final_result)
 
         # Test differentiability
-        path, loss = stl_diff_examples.backward()
+        path, loss = stl_diff_examples.backward(self.key)
         print('Path', path)
         assert loss < TEST_TOLERANCE  # Loss should be less than 0 to satisfy the formula
         # (jax.lax.fori_loop(0, 1000, lambda i, _: jit(eval_reach_avoid)(), None)).block_until_ready()

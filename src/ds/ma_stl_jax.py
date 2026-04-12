@@ -57,9 +57,8 @@ class Task(TaskBase):
             return self.regular_val(path, start_t, train_mode)
 
     def exponential_val(self, path, start_t, train_mode):
-        topk_vals, topk_ind = jax.lax.top_k(self.spec.eval(path, start_t, train_mode=train_mode),
-                                            self.num_satisfied_agents)
         vals = self.spec.eval(path, start_t, train_mode=train_mode)
+        topk_vals, topk_ind = jax.lax.top_k(vals, self.num_satisfied_agents)
         topk_val = topk_vals[-1]
         # Compute an index based on the sign of min_val:
         #   0 -> negative, 1 -> positive, 2 -> zero.
@@ -337,7 +336,11 @@ class CaTLPlus:
         target_code = OP_SYMBOLS["&"] if flat_and else OP_SYMBOLS["|"]
         while stack:
             node = stack.pop()
-            if (isinstance(node, list) or isinstance(node, tuple)) and node[0] == target_code:
+            # Leaves (Task, PredicateBase, ...) are NamedTuples, so we must guard
+            # against their tuple-ness before indexing node[0] as an op code.
+            if (not self._is_leaf(node)
+                    and isinstance(node, (list, tuple))
+                    and node[0] == target_code):
                 # node is of the form: ['&', left, right]
                 # push its children on the stack
                 stack.append(node[2])

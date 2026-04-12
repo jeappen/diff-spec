@@ -788,6 +788,7 @@ class STL:
             end_t: int = None,
             train_mode: bool = False
     ) -> jnp.array:
+        # TODO: This is wrong semantics
         if self._is_leaf(sub_form2):
             till_pred = sub_form2.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode)
         else:
