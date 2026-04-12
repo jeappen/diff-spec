@@ -65,28 +65,33 @@ Probability temporal logic is an ongoing work integrating probability and random
 
 ## JAX Backend
 
-If you are using JAX, you can use the JAX backend (stl_jax) and gain immense speedups in many cases.
-
-First set the backend to JAX using Environment Variables for our utility functions:
-
-```python
-import os
-
-os.environ["DIFF_STL_BACKEND"] = "jax"  # set the backend to JAX (if unset or any other value uses the PyTorch backend)
-```
-
-Then you can use the JAX backend to optimize the inputs to satisfy the formula.
+JAX is the default backend. Just import from `ds.stl_jax`:
 
 ```python
 from ds.stl_jax import STL, RectAvoidPredicate, RectReachPredicate
 from ds.utils import default_tensor
 ```
 
-For a comparison of the speedup, you can run the [JAX backend test](tests/test_stl_jax.py) and compare it with
-the [PyTorch backend test](tests/test_stl.py).
-Be sure to use JIT (carefully) and other JAX optimizations to get the best performance.
+No environment variable is required. `default_tensor` resolves the active
+backend on every call, so importing `ds.stl_jax` (which sets the backend
+internally) is enough — no reload dance, no snapshotting.
 
-For example, on our test machine, the given test cases on the JAX backend are 2x faster than the PyTorch backend.
+### Opting into the PyTorch backend
+
+Set `DIFF_STL_BACKEND=torch` **before** importing `ds.stl`:
+
+```python
+import os
+os.environ["DIFF_STL_BACKEND"] = "torch"
+
+from ds.stl import STL, RectAvoidPredicate, RectReachPredicate
+from ds.utils import default_tensor
+```
+
+Any value other than `torch` (unset, `jax`, empty, etc.) selects JAX.
+
+For a comparison of the speedup, run the [JAX backend test](tests/test_stl_jax.py) and compare it with
+the [PyTorch backend test](tests/test_stl.py). Be sure to use JIT (carefully) and other JAX optimizations to get the best performance. On our test machine, the given test cases run ~2x faster on JAX than on PyTorch.
 
 ## Citation
 

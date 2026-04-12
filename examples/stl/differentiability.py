@@ -8,20 +8,20 @@ import optax
 
 import ds.utils as ds_utils
 
-# if JAX_BACKEND is set the import will be from jax.numpy
-if os.environ.get("DIFF_STL_BACKEND") == "jax":
-    print("Using JAX backend")
-    from ds.stl_jax import STL, RectAvoidPredicate, RectReachPredicate
-
-    importlib.reload(ds_utils)  # Reload the module to reset the backend
-    import jax
-else:
+# JAX is the default backend; set DIFF_STL_BACKEND=torch to opt into PyTorch.
+if os.environ.get("DIFF_STL_BACKEND", "").lower() == "torch":
     print("Using PyTorch backend")
     from ds.stl import STL, RectAvoidPredicate, RectReachPredicate
 
     importlib.reload(ds_utils)  # Reload the module to reset the backend
     import torch
     from torch.optim import Adam
+else:
+    print("Using JAX backend")
+    from ds.stl_jax import STL, RectAvoidPredicate, RectReachPredicate
+
+    importlib.reload(ds_utils)  # Reload the module to reset the backend
+    import jax
 
 
 def eval_reach_avoid(mute=False):
@@ -157,7 +157,7 @@ def backward(jax_key=None, avoid_spec=False, mute=True):
     lr = 0.1
     num_iterations = 1000
 
-    if os.environ.get("DIFF_STL_BACKEND") == "jax":
+    if os.environ.get("DIFF_STL_BACKEND", "").lower() != "torch":
 
         if jax_key is None:
             jax_key = jax.random.PRNGKey(0)
@@ -246,7 +246,7 @@ def mabackward(jax_key=None, ma_stl_spec=None, avoid_spec=False, mute=True):
     num_iterations = 1000
     num_agents = 8
 
-    if os.environ.get("DIFF_STL_BACKEND") == "jax":
+    if os.environ.get("DIFF_STL_BACKEND", "").lower() != "torch":
 
         if jax_key is None:
             jax_key = jax.random.PRNGKey(0)

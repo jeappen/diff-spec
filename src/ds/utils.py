@@ -176,13 +176,15 @@ except ImportError:
 
 
 def _active_backend() -> str:
-    if os.environ.get("DIFF_STL_BACKEND") == "jax":
-        if _jax is None:
-            raise RuntimeError("DIFF_STL_BACKEND=jax but jax is not installed")
-        return "jax"
-    if _torch is None:
-        raise RuntimeError("torch backend requested but torch is not installed")
-    return "torch"
+    # Default is jax; opt into torch explicitly via DIFF_STL_BACKEND=torch.
+    val = os.environ.get("DIFF_STL_BACKEND", "").lower()
+    if val == "torch":
+        if _torch is None:
+            raise RuntimeError("DIFF_STL_BACKEND=torch but torch is not installed")
+        return "torch"
+    if _jax is None:
+        raise RuntimeError("jax backend requested but jax is not installed")
+    return "jax"
 
 
 def _jax_default_tensor(x: np.ndarray, device=None, dtype=None):

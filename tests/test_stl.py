@@ -13,7 +13,7 @@ TEST_TOLERANCE = 1e-3  # Small number close to 0
 class TestExamples(unittest.TestCase):
 
     def setUp(self):
-        os.environ["DIFF_STL_BACKEND"] = ""
+        os.environ["DIFF_STL_BACKEND"] = "torch"
         importlib.reload(stl_diff_examples)  # Reload the module to reset the backend
         importlib.reload(ds_utils)  # Reload the module to reset the backend
         # The torch path in differentiability.backward seeds the initial
