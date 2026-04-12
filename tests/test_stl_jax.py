@@ -154,5 +154,118 @@ class TestJAXExamples(unittest.TestCase):
             self.assertGreater(loss[0], 0, f"STLPY solved path loss is not greater than 0 for {form}")
 
 
+class TestUntilSemantics(unittest.TestCase):
+    """Targeted tests for the `until` operator semantics.
+
+    Ground truth for sign/ordering comes from stlpy's analytic robustness.
+    Soft-min/soft-max approximations used by the JAX backend can shift the
+    magnitude, so we assert on *sign* and on leaf-vs-nonleaf consistency
+    rather than exact numeric equality.
+    """
+
+    def setUp(self):
+        os.environ["DIFF_STL_BACKEND"] = "jax"
+        importlib.reload(ds_utils)
+
+        # Two disjoint reach regions
+        self.phi1 = STL(RectReachPredicate(np.array([0, 0]), np.array([2, 2]), "phi1"))
+        self.phi2 = STL(RectReachPredicate(np.array([4, 4]), np.array([2, 2]), "phi2"))
+
+        # phi1 U_[0, 10] phi2, evaluated on paths of length 11
+        self.T = 11
+        self.interval = (0, self.T - 1)
+        self.until_form = self.phi1.until(self.phi2, *self.interval)
+
+    @staticmethod
+    def _stlpy_robustness(stl_form, np_path):
+        """Ground-truth robustness at t=0. np_path has shape (T, d); stlpy wants (d, T)."""
+        return stl_form.get_stlpy_form().robustness(np_path.T, 0)
+
+    def _jax_eval(self, form, np_path):
+        """Evaluate on a single-batch path."""
+        return float(form.eval(ds_utils.default_tensor(np_path[None])).squeeze())
+
+    # --- paths ---
+
+    @property
+    def _path_sat(self):
+        """Stay in phi1 for the first half, then move to phi2 and stay."""
+        return np.array([[0, 0]] * 5 + [[4, 4]] * 6, dtype=np.float32)
+
+    @property
+    def _path_never_phi2(self):
+        """Stay in phi1 the whole time; phi2 is never reached."""
+        return np.array([[0, 0]] * self.T, dtype=np.float32)
+
+    @property
+    def _path_phi1_broken(self):
+        """Leave phi1 into neutral space, then arrive at phi2."""
+        return np.array(
+            [[0, 0], [0, 0]]
+            + [[10, 10]] * 4          # far from both regions
+            + [[4, 4]] * 5,
+            dtype=np.float32,
+        )
+
+    # --- tests ---
+
+    def test_until_satisfying(self):
+        """phi1 holds, then phi2 is reached → robustness > 0."""
+        gt = self._stlpy_robustness(self.until_form, self._path_sat)
+        rho = self._jax_eval(self.until_form, self._path_sat)
+        self.assertGreater(gt, 0, f"stlpy GT should be positive, got {gt}")
+        self.assertGreater(rho, 0, f"JAX until() should be positive on sat path, got {rho}")
+
+    def test_until_unsat_phi2_never_reached(self):
+        """phi2 is never reached → robustness < 0."""
+        gt = self._stlpy_robustness(self.until_form, self._path_never_phi2)
+        rho = self._jax_eval(self.until_form, self._path_never_phi2)
+        self.assertLess(gt, 0, f"stlpy GT should be negative, got {gt}")
+        self.assertLess(rho, 0, f"JAX until() should be negative on never-phi2 path, got {rho}")
+
+    def test_until_unsat_phi1_broken_before_phi2(self):
+        """phi1 is violated before phi2 is reached → robustness < 0."""
+        gt = self._stlpy_robustness(self.until_form, self._path_phi1_broken)
+        rho = self._jax_eval(self.until_form, self._path_phi1_broken)
+        self.assertLess(gt, 0, f"stlpy GT should be negative, got {gt}")
+        self.assertLess(rho, 0, f"JAX until() should be negative on phi1-broken path, got {rho}")
+
+    def test_until_leaf_vs_nonleaf_phi2(self):
+        """Wrapping phi2 in a trivial conjunction must not change the semantics."""
+        leaf = self.phi1.until(self.phi2, *self.interval)
+        compound = self.phi1.until(self.phi2 & self.phi2, *self.interval)
+        for name, p in [("sat", self._path_sat), ("never_phi2", self._path_never_phi2)]:
+            leaf_rho = self._jax_eval(leaf, p)
+            comp_rho = self._jax_eval(compound, p)
+            self.assertTrue(
+                np.sign(leaf_rho) == np.sign(comp_rho) or abs(leaf_rho - comp_rho) < 1e-2,
+                f"leaf vs non-leaf phi2 disagree on {name}: leaf={leaf_rho}, compound={comp_rho}",
+            )
+
+    def test_until_leaf_vs_nonleaf_phi1(self):
+        """Same, wrapping phi1."""
+        leaf = self.phi1.until(self.phi2, *self.interval)
+        compound = (self.phi1 & self.phi1).until(self.phi2, *self.interval)
+        for name, p in [("sat", self._path_sat), ("phi1_broken", self._path_phi1_broken)]:
+            leaf_rho = self._jax_eval(leaf, p)
+            comp_rho = self._jax_eval(compound, p)
+            self.assertTrue(
+                np.sign(leaf_rho) == np.sign(comp_rho) or abs(leaf_rho - comp_rho) < 1e-2,
+                f"leaf vs non-leaf phi1 disagree on {name}: leaf={leaf_rho}, compound={comp_rho}",
+            )
+
+    def test_until_nested_in_always(self):
+        """G_[0,1] (phi1 U_[0,9] phi2) — exercises non-zero start_t in until."""
+        path = np.concatenate([
+            np.array([[0, 0]] * 4, dtype=np.float32),
+            np.array([[4, 4]] * 7, dtype=np.float32),
+        ])
+        form = self.phi1.until(self.phi2, 0, 9).always(0, 1)
+        gt = self._stlpy_robustness(form, path)
+        rho = self._jax_eval(form, path)
+        self.assertGreater(gt, 0, f"stlpy GT should be positive for nested until, got {gt}")
+        self.assertGreater(rho, 0, f"JAX nested until should be positive, got {rho}")
+
+
 if __name__ == '__main__':
     unittest.main()

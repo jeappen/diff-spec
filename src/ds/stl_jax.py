@@ -609,7 +609,12 @@ class STL:
         target_code = OP_SYMBOLS["&"] if flat_and else OP_SYMBOLS["|"]
         while stack:
             node = stack.pop()
-            if (isinstance(node, list) or isinstance(node, tuple)) and node[0] == target_code:
+            # Leaves (RectangularPredicate, ...) are NamedTuples with numpy
+            # array fields, so `node[0] == target_code` would broadcast to an
+            # array rather than a bool. Guard with _is_leaf before indexing.
+            if (not self._is_leaf(node)
+                    and isinstance(node, (list, tuple))
+                    and node[0] == target_code):
                 # node is of the form: ['&', left, right] or ['|', left, right]
                 # push its children on the stack
                 stack.append(node[2])
@@ -788,44 +793,35 @@ class STL:
             end_t: int = None,
             train_mode: bool = False
     ) -> jnp.array:
-        # TODO: This is wrong semantics
-        if self._is_leaf(sub_form2):
-            till_pred = sub_form2.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode)
-        else:
-            till_pred = jnp.stack(
+        # Standard STL until robustness:
+        #   ρ(φ₁ U_[start_t, end_t) φ₂)
+        #     = max_{t' ∈ [start_t, end_t)} min( min_{t'' ∈ [start_t, t')} ρ(φ₁, t''),
+        #                                        ρ(φ₂, t') )
+        # The inner min over an empty prefix (at t' = start_t) is vacuously
+        # true, encoded by a large sentinel so _tensor_min defers to φ₂.
+        def unroll(sub_form):
+            if self._is_leaf(sub_form):
+                return sub_form.eval_whole_path(path[:, start_t:end_t],
+                                                train_mode=train_mode)
+            return jnp.stack(
                 [
-                    self._eval(sub_form2, path, start_t=t, end_t=end_t, train_mode=train_mode)
+                    self._eval(sub_form, path, start_t=start_t + t, end_t=end_t,
+                               train_mode=train_mode)
                     for t in range(end_t - start_t)
                 ],
                 axis=-1,
             )
 
-        # mask condition...
-        cond = (till_pred > 0).astype(int)
-        index = jnp.argmax(cond, axis=-1)
-        batch_size, seq_len = cond.shape
-        row_indices = jnp.arange(batch_size)[:, None]
-        col_indices = jnp.arange(seq_len)
-        mask = col_indices >= index[:, None]
-        cond = ~mask.astype(bool)
+        f1 = unroll(sub_form1)  # (..., T)
+        f2 = unroll(sub_form2)  # (..., T)
 
-        # Set true values after 'till' is satisfied
-        till_pred = jnp.where(cond, till_pred, ds_utils.default_tensor(1))
+        # Running min of φ₁ over [start_t, t'-1]: shift inclusive cummin right.
+        f1_cum = jax.lax.associative_scan(jnp.minimum, f1, axis=-1)
+        sentinel = jnp.full(f1_cum.shape[:-1] + (1,), 1e9, dtype=f1_cum.dtype)
+        f1_cum_excl = jnp.concatenate([sentinel, f1_cum[..., :-1]], axis=-1)
 
-        if self._is_leaf(sub_form1):
-            res = sub_form1.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode)
-        else:
-            res = jnp.stack(
-                [
-                    self._eval(sub_form1, path, start_t=t, end_t=end_t, train_mode=train_mode)
-                    for t in range(end_t - start_t)
-                ],
-                axis=-1,
-            )
-
-        res = jnp.where(cond, res, ds_utils.default_tensor(-1))
-        # when cond < 0, res should always > 0 to be hold
-        return self._tensor_min(-res * till_pred, axis=-1)
+        per_t = self._tensor_min(jnp.stack([f1_cum_excl, f2], axis=-1), axis=-1)
+        return self._tensor_max(per_t, axis=-1)
 
     def get_stlpy_form(self):
         # catch already converted form
