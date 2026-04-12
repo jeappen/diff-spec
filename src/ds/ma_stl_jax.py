@@ -117,7 +117,7 @@ class CaTLPlus:
         single_operators = ("~",)
         binary_operators = ("&", "|", "->", "U")
         sequence_operators = ("G", "F", "U")
-        not_implemented = ("G", "F", "U", "->")
+        not_implemented = ("G", "F", "->")
         self.single_operators = tuple(OP_SYMBOLS[op] for op in single_operators)
         self.binary_operators = tuple(OP_SYMBOLS[op] for op in binary_operators)
         self.sequence_operators = tuple(OP_SYMBOLS[op] for op in sequence_operators)
@@ -539,43 +539,29 @@ class CaTLPlus:
             end_t: int = None,
             train_mode: bool = False
     ) -> jnp.array:
-        if self._is_leaf(sub_form2):
-            till_pred = sub_form2.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode)
-        else:
-            till_pred = jnp.stack(
+        # Standard STL until robustness; mirrors STL._eval_until.
+        # Task leaves return a scalar per time step (not a trace), so we
+        # always unroll via self._eval rather than taking the leaf shortcut.
+        def trace(sub_form):
+            return jnp.stack(
                 [
-                    self._eval(sub_form2, path, start_t=t, end_t=end_t, train_mode=train_mode)
+                    self._eval(sub_form, path, start_t=start_t + t, end_t=end_t,
+                               train_mode=train_mode)
                     for t in range(end_t - start_t)
                 ],
                 axis=-1,
             )
 
-        # mask condition...
-        cond = (till_pred > 0).castype(int)
-        index = jnp.argmax(cond, axis=-1)
-        batch_size, seq_len = cond.shape
-        row_indices = jnp.arange(batch_size)[:, None]
-        col_indices = jnp.arange(seq_len)
-        mask = col_indices >= index[:, None]
-        cond = ~mask.castype(bool)
+        f1 = trace(sub_form1)
+        f2 = trace(sub_form2)
 
-        # Set true values after 'till' is satisfied
-        till_pred = jnp.where(cond, till_pred, ds_utils.default_tensor(1))
+        # Running min of φ₁ over [start_t, t'-1]: shift inclusive cummin right.
+        f1_cum = jax.lax.associative_scan(jnp.minimum, f1, axis=-1)
+        sentinel = jnp.full(f1_cum.shape[:-1] + (1,), 1e9, dtype=f1_cum.dtype)
+        f1_cum_excl = jnp.concatenate([sentinel, f1_cum[..., :-1]], axis=-1)
 
-        if self._is_leaf(sub_form1):
-            res = sub_form1.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode)
-        else:
-            res = jnp.stack(
-                [
-                    self._eval(sub_form1, path, start_t=t, end_t=end_t, train_mode=train_mode)
-                    for t in range(end_t - start_t)
-                ],
-                axis=-1,
-            )
-
-        res = jnp.where(cond, res, ds_utils.default_tensor(-1))
-        # when cond < 0, res should always > 0 to be hold
-        return self._tensor_min(-res * till_pred, axis=-1)
+        per_t = self._tensor_min(jnp.stack([f1_cum_excl, f2], axis=-1), axis=-1)
+        return self._tensor_max(per_t, axis=-1)
 
     def __repr__(self):
         if self.expr_repr is not None:

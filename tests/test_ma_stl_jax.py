@@ -266,5 +266,85 @@ class TestMASTLJAXExamples(unittest.TestCase):
         self.assertLess(loss[0], 0, f"Loss is not less than 0 for unsat path")
 
 
+class TestCaTLPlusUntilSemantics(unittest.TestCase):
+    """Targeted semantics tests for CaTLPlus's `until` operator.
+
+    Should mirror `STL.until` for tasks with a single agent and
+    `num_satisfied_agents=1`: standard-STL robustness, differentiable,
+    sign-consistent with stlpy.
+    """
+
+    def setUp(self):
+        os.environ["DIFF_STL_BACKEND"] = "jax"
+        importlib.reload(ds_utils)
+
+        # Task names chosen outside the 0..6 op-code range to avoid any
+        # residual collisions in flatten-style traversals.
+        self.phi1_stl = STL(RectReachPredicate(np.array([0, 0]), np.array([2, 2]), "phi1"))
+        self.phi2_stl = STL(RectReachPredicate(np.array([4, 4]), np.array([2, 2]), "phi2"))
+        self.task_A = Task(10, self.phi1_stl, 1, None)
+        self.task_B = Task(11, self.phi2_stl, 1, None)
+
+        self.A = CaTLPlus(self.task_A)
+        self.B = CaTLPlus(self.task_B)
+        self.T = 11
+
+    def _batch(self, np_path_per_agent):
+        """np_path_per_agent has shape (num_agents, T, d); return a jax tensor."""
+        return ds_utils.default_tensor(np_path_per_agent)
+
+    def test_until_satisfying(self):
+        """Agent stays in phi1 then reaches phi2 → robustness > 0."""
+        path = self._batch(np.array([[[0, 0]] * 5 + [[4, 4]] * 6], dtype=np.float32))
+        form = self.A.until(self.B, 0, self.T - 1)
+        rho = float(form.eval(path))
+        self.assertGreater(rho, 0, f"sat path should have positive robustness, got {rho}")
+
+    def test_until_unsat_phi2_never_reached(self):
+        """Agent stays in phi1, never reaches phi2 → robustness < 0.
+
+        The pre-fix code returned a spurious +1.0 here.
+        """
+        path = self._batch(np.array([[[0, 0]] * self.T], dtype=np.float32))
+        form = self.A.until(self.B, 0, self.T - 1)
+        rho = float(form.eval(path))
+        self.assertLess(rho, 0, f"never-phi2 path should be negative, got {rho}")
+
+    def test_until_unsat_phi1_broken_before_phi2(self):
+        """Agent leaves phi1 before phi2 arrives → robustness < 0."""
+        path = self._batch(
+            np.array([[
+                [0, 0], [0, 0],
+                [10, 10], [10, 10], [10, 10], [10, 10],
+                [4, 4], [4, 4], [4, 4], [4, 4], [4, 4],
+            ]], dtype=np.float32)
+        )
+        form = self.A.until(self.B, 0, self.T - 1)
+        rho = float(form.eval(path))
+        self.assertLess(rho, 0, f"phi1-broken path should be negative, got {rho}")
+
+    def test_until_multi_agent_m_of_n(self):
+        """With num_satisfied_agents=2, both agents must contribute to the witness."""
+        task_A2 = Task(12, self.phi1_stl, 2, None)
+        task_B2 = Task(13, self.phi2_stl, 2, None)
+        A2 = CaTLPlus(task_A2)
+        B2 = CaTLPlus(task_B2)
+
+        # Two agents both follow the satisfying pattern.
+        ok_path = self._batch(np.stack([
+            np.array([[0, 0]] * 5 + [[4, 4]] * 6, dtype=np.float32),
+            np.array([[0, 0]] * 5 + [[4, 4]] * 6, dtype=np.float32),
+        ], axis=0))
+        # Only one agent ever reaches phi2, so the 2-of-2 witness must fail.
+        bad_path = self._batch(np.stack([
+            np.array([[0, 0]] * 5 + [[4, 4]] * 6, dtype=np.float32),
+            np.array([[0, 0]] * self.T, dtype=np.float32),
+        ], axis=0))
+
+        form = A2.until(B2, 0, self.T - 1)
+        self.assertGreater(float(form.eval(ok_path)), 0)
+        self.assertLess(float(form.eval(bad_path)), 0)
+
+
 if __name__ == '__main__':
     unittest.main()
