@@ -16,6 +16,11 @@ class TestExamples(unittest.TestCase):
         os.environ["DIFF_STL_BACKEND"] = ""
         importlib.reload(stl_diff_examples)  # Reload the module to reset the backend
         importlib.reload(ds_utils)  # Reload the module to reset the backend
+        # The torch path in differentiability.backward seeds the initial
+        # path with np.random.rand; pin it so combined pytest runs (where
+        # earlier tests perturb the global numpy RNG) stay deterministic.
+        np.random.seed(0)
+        torch.manual_seed(0)
 
     def test_run(self):
         # Test Eval

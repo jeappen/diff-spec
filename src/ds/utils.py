@@ -136,38 +136,88 @@ def outside_rectangle_formula(bounds, y1_index, y2_index, d, name=None):
     return outside_rectangle
 
 
-# if JAX_BACKEND is set the import will be from jax.numpy
-if os.environ.get("DIFF_STL_BACKEND") == "jax":
-    # print("Using JAX backend")
+# Backend dispatch for default_tensor. Historically this module branched on
+# DIFF_STL_BACKEND *at import time*, binding a different `default_tensor`
+# into the module globals for each backend. Downstream modules that did
+# `from ds.utils import default_tensor` then snapshotted whichever version
+# happened to be live when they were first imported — so flipping the env
+# var and calling `importlib.reload(ds_utils)` in a test setUp rebound
+# ds.utils.default_tensor but left consumers (e.g. ds/stl.py) pointing at
+# the stale snapshot of the other backend. That caused the
+# `jnp.asarray(..., dtype=torch.float32)` failures when torch and jax
+# tests ran in the same pytest session.
+#
+# Fix: dispatch on every call. Each backend keeps its own private constants
+# so a call always uses the dtype/device that matches the function it runs.
+# Selecting a backend is now just setting DIFF_STL_BACKEND; no reload needed.
 
-    import jax
-    from jax import numpy as jnp
+_jax = None
+_jax_device = None
+_jax_dtype = None
+try:
+    import jax as _jax_mod
+    from jax import numpy as _jnp
+    _jax = _jax_mod
+    _jax_device = _jax.devices()[0]
+    _jax_dtype = _jnp.float32
+except ImportError:
+    pass
 
-    print(jnp.ones(3).devices())
-
-    DEFAULT_DEVICE = jax.devices()[0]
-    DEFAULT_DATATYPE = jnp.float32
-
-
-    def default_tensor(x: np.ndarray, device: str = None, dtype=None) -> jnp.array:
-        return jax.device_put(jnp.asarray(
-            x,
-            dtype=DEFAULT_DATATYPE if dtype is None else dtype,
-        ), DEFAULT_DEVICE if device is None else device)
-
-
-else:
-    # print("Using PyTorch backend")
-
-    import torch
-
-    DEFAULT_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    DEFAULT_DATATYPE = torch.float32
+_torch = None
+_torch_device = None
+_torch_dtype = None
+try:
+    import torch as _torch_mod
+    _torch = _torch_mod
+    _torch_device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+    _torch_dtype = _torch.float32
+except ImportError:
+    pass
 
 
-    def default_tensor(x: np.ndarray, device: str = None, dtype=None) -> torch.Tensor:
-        return torch.tensor(
-            x,
-            dtype=DEFAULT_DATATYPE if dtype is None else dtype,
-            device=DEFAULT_DEVICE if device is None else device,
-        )
+def _active_backend() -> str:
+    if os.environ.get("DIFF_STL_BACKEND") == "jax":
+        if _jax is None:
+            raise RuntimeError("DIFF_STL_BACKEND=jax but jax is not installed")
+        return "jax"
+    if _torch is None:
+        raise RuntimeError("torch backend requested but torch is not installed")
+    return "torch"
+
+
+def _jax_default_tensor(x: np.ndarray, device=None, dtype=None):
+    return _jax.device_put(
+        _jnp.asarray(x, dtype=_jax_dtype if dtype is None else dtype),
+        _jax_device if device is None else device,
+    )
+
+
+def _torch_default_tensor(x: np.ndarray, device=None, dtype=None):
+    return _torch.tensor(
+        x,
+        dtype=_torch_dtype if dtype is None else dtype,
+        device=_torch_device if device is None else device,
+    )
+
+
+def default_tensor(x: np.ndarray, device=None, dtype=None):
+    """Create a backend tensor, choosing backend via $DIFF_STL_BACKEND at call time.
+
+    Safe against cross-backend reloads: the dispatch closure is stable, only
+    the env-var lookup varies, so `from ds.utils import default_tensor`
+    captures the dispatcher rather than a backend-specific snapshot.
+    """
+    if _active_backend() == "jax":
+        return _jax_default_tensor(x, device=device, dtype=dtype)
+    return _torch_default_tensor(x, device=device, dtype=dtype)
+
+
+# Preserve the public `DEFAULT_DEVICE` / `DEFAULT_DATATYPE` names for any
+# consumer that reads them as module attributes. Resolve dynamically so
+# attribute access always reflects the active backend.
+def __getattr__(name):
+    if name == "DEFAULT_DEVICE":
+        return _jax_device if _active_backend() == "jax" else _torch_device
+    if name == "DEFAULT_DATATYPE":
+        return _jax_dtype if _active_backend() == "jax" else _torch_dtype
+    raise AttributeError(name)
