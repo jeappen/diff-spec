@@ -138,62 +138,6 @@ class CaTLPlus:
         self.cast = cast
         self.tuple_cast = list_to_tuple(cast)
 
-    def _transform_ast(self, node):
-        """Recursively walk the AST and replace any string operator with its numeric code."""
-        if self._is_leaf(node):
-            # Leaves (TaskBase, etc.) remain unchanged
-            return node
-
-        op = node[0]
-        # If operator is a string (like "G", "U", etc.) then map it to integer
-        if isinstance(op, str) and op in OP_SYMBOLS:
-            op_code = OP_SYMBOLS[op]
-
-            # Single-operator forms, e.g. NOT ("~")
-            if op_code == OP_SYMBOLS["~"]:
-                return [op_code, self._transform_ast(node[1])]
-
-            # Two-operand forms that also might have time windows:
-            # e.g. "G", "F" => shape: [ "G", sub_form, start, end ]
-            # e.g. "U" => [ "U", sub_form1, sub_form2, start, end ]
-            # e.g. "&", "|", "->" => [ op, sub_form1, sub_form2 ]
-            if op_code in (OP_SYMBOLS["G"], OP_SYMBOLS["F"]):
-                # time-bounded unary operator
-                return [
-                    op_code,
-                    self._transform_ast(node[1]),
-                    node[2],
-                    node[3],
-                ]
-            elif op_code == OP_SYMBOLS["U"]:
-                return [
-                    op_code,
-                    self._transform_ast(node[1]),
-                    self._transform_ast(node[2]),
-                    node[3],
-                    node[4],
-                ]
-            else:
-                # e.g. "&", "|", "->"
-                return [
-                    op_code,
-                    self._transform_ast(node[1]),
-                    self._transform_ast(node[2]),
-                ]
-        else:
-            # Possibly already transformed, or an unknown operator
-            # If it's a list of length >= 2, we still attempt recursion
-            if isinstance(node, list) or isinstance(node, tuple):
-                # Recursively transform each child that might be an operator
-                transformed_children = []
-                # The first element is either an already replaced op or something else
-                transformed_children.append(node[0])
-                for child in node[1:]:
-                    transformed_children.append(self._transform_ast(child))
-                return transformed_children
-
-        return node
-
     """
     Syntax Functions
     (They produce integer-coded cASTs rather than string-coded.)
