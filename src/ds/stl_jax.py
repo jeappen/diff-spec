@@ -7,6 +7,7 @@ import os
 from abc import abstractmethod
 from contextlib import redirect_stdout
 from jax.nn import softmax
+from jax.scipy.special import logsumexp
 from stlpy.STL import LinearPredicate as baseLinearPredicate, STLTree
 from typing import TypeVar, NamedTuple
 
@@ -21,6 +22,14 @@ with redirect_stdout(io.StringIO()):
 import logging
 
 colored, HARDNESS, IMPLIES_TRICK, set_hardness = ds_utils.colored, ds_utils.HARDNESS, ds_utils.IMPLIES_TRICK, ds_utils.set_hardness
+
+# Default soft-min/max approximation for AND/OR/ALWAYS/EVENTUALLY/UNTIL reductions.
+# Overridable per-call via STL.eval(..., approx_method=...) or globally by assigning
+# ds.stl_jax.APPROX_METHOD before tracing. Options:
+#   "softmax"   - legacy softmax-weighted-sum (default; biased, can plateau at the boundary)
+#   "logsumexp" - mass-conserving smooth max (no vanishing-gradient plateau)
+#   "true"      - exact jnp.max/min (gradient distributed across argmax ties)
+APPROX_METHOD = "softmax"
 outside_npy = ds_utils.outside_rectangle_formula
 inside_npy = ds_utils.inside_rectangle_formula
 
@@ -402,8 +411,19 @@ def list_to_tuple(x):
     return x
 
 
+# Shared by ds.ma_stl_jax (imported via `from .stl_jax import *`); its jitted _eval
+# methods have the original 6/7-arg signatures, so these must stay as-is.
 STATIC_ARGNUMS_UNARY = (0, 1, 3, 4, 5)
 STATIC_ARGNUMS_BINARY = (0, 1, 2, 4, 5, 6)
+
+# stl_jax-only: eval fns additionally take ..., hardness (dynamic/traced), approx_method (static).
+# UNARY_AM  sig: (self, ast,  path, start_t, end_t, train_mode, hardness, approx_method)
+#                  0    1     2     3        4      5           6         7
+# BINARY_AM sig: (self, sf1, sf2,  path, start_t, end_t, train_mode, hardness, approx_method)
+#                  0    1    2     3     4        5      6           7         8
+# hardness stays dynamic (vary per step, no retrace); approx_method is static.
+STATIC_ARGNUMS_UNARY_AM = (0, 1, 3, 4, 5, 7)
+STATIC_ARGNUMS_BINARY_AM = (0, 1, 2, 4, 5, 6, 8)
 
 
 class STL:
@@ -524,18 +544,34 @@ class STL:
         ast = [OP_SYMBOLS["U"], self.ast, other.ast, start, end]
         return STL(ast)
 
-    def eval(self, path: jnp.array, t: int = 0, train_mode: bool = False) -> jnp.array:
+    def eval(self, path: jnp.array, t: int = 0, train_mode: bool = False,
+             hardness=None, approx_method: str = None) -> jnp.array:
         """Evaluate the formula at time t.
 
         :param path:            The motion path to evaluate the formula on.
         :param train_mode:   Whether to evaluate in training mode (conservative with shrink factor).
         :param t:               The time step to evaluate the formula at.
+        :param hardness:        Soft-min/max temperature for this call. None -> module HARDNESS.
+                                Pass a traced scalar to vary per step (e.g. per denoising step)
+                                without retracing.
+        :param approx_method:   Soft-min/max approximation ("softmax"/"logsumexp"/"true") for this
+                                call. None -> module APPROX_METHOD. Static (a change retraces once).
         """
-        return self._eval(self.tuple_ast, path, t, train_mode=train_mode)
+        # Resolve defaults at the Python level so the (possibly traced) hardness and the
+        # static approx_method flow as explicit args into the jitted eval region. None passed
+        # down would bake the module globals (the legacy behaviour) instead.
+        if hardness is None:
+            hardness = HARDNESS
+        if approx_method is None:
+            approx_method = APPROX_METHOD
+        return self._eval(self.tuple_ast, path, t, train_mode=train_mode,
+                          hardness=hardness, approx_method=approx_method)
 
-    def eval_train(self, path: jnp.array, t: int = 0) -> jnp.array:
+    def eval_train(self, path: jnp.array, t: int = 0,
+                   hardness=None, approx_method: str = None) -> jnp.array:
         """To help prevent recompilation in jax.jit, we separate the training mode evaluation."""
-        return self.eval(path, t, train_mode=True)
+        return self.eval(path, t, train_mode=True,
+                         hardness=hardness, approx_method=approx_method)
 
     def end_time(self) -> int:
         """Get the end time of the formula efficiently."""
@@ -561,14 +597,16 @@ class STL:
         # Is binary operator
         return max(self._get_end_time(ast[1]), self._get_end_time(ast[2]))
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY_AM)
     def _eval(
             self,
             ast: AST,
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
-            train_mode: bool = False
+            train_mode: bool = False,
+            hardness=None,
+            approx_method: str = None
     ) -> jnp.array:
         if self._is_leaf(ast):
             return ast.eval_at_t(path, start_t, train_mode=train_mode)
@@ -580,20 +618,21 @@ class STL:
             if end_t > path.shape[1]:
                 self.logger.warning("end_t is larger than motion length")
 
+        kw = dict(train_mode=train_mode, hardness=hardness, approx_method=approx_method)
         if op_code == OP_SYMBOLS["&"]:
-            return self._eval_and(ast[1], ast[2], path, start_t, end_t, train_mode=train_mode)
+            return self._eval_and(ast[1], ast[2], path, start_t, end_t, **kw)
         elif op_code == OP_SYMBOLS["|"]:
-            return self._eval_or(ast[1], ast[2], path, start_t, end_t, train_mode=train_mode)
+            return self._eval_or(ast[1], ast[2], path, start_t, end_t, **kw)
         elif op_code == OP_SYMBOLS["~"]:
-            return self._eval_not(ast[1], path, start_t, end_t, train_mode=train_mode)
+            return self._eval_not(ast[1], path, start_t, end_t, **kw)
         elif op_code == OP_SYMBOLS["->"]:
-            return self._eval_implies(ast[1], ast[2], path, start_t, end_t, train_mode=train_mode)
+            return self._eval_implies(ast[1], ast[2], path, start_t, end_t, **kw)
         elif op_code == OP_SYMBOLS["G"]:
-            return self._eval_always(ast[1], path, start_t, end_t, train_mode=train_mode)
+            return self._eval_always(ast[1], path, start_t, end_t, **kw)
         elif op_code == OP_SYMBOLS["F"]:
-            return self._eval_eventually(ast[1], path, start_t, end_t, train_mode=train_mode)
+            return self._eval_eventually(ast[1], path, start_t, end_t, **kw)
         elif op_code == OP_SYMBOLS["U"]:
-            return self._eval_until(ast[1], ast[2], path, start_t, end_t, train_mode=train_mode)
+            return self._eval_until(ast[1], ast[2], path, start_t, end_t, **kw)
 
         raise ValueError(f"Unknown operator {ast[0]}")
 
@@ -624,7 +663,7 @@ class STL:
                 result.append(node)
         return result
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY_AM)
     def _eval_and(
             self,
             sub_form1: AST,
@@ -632,7 +671,9 @@ class STL:
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
-            train_mode: bool = False
+            train_mode: bool = False,
+            hardness=None,
+            approx_method: str = None
     ) -> jnp.array:
         def regular_and(_sub_form1, _sub_form2, _path, _start_t, _end_t):
             _train_mode = False
@@ -640,30 +681,34 @@ class STL:
 
             # 2. Evaluate each subformula
             vals = [
-                self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode)
+                self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode,
+                           hardness=hardness, approx_method=approx_method)
                 for subf in subforms
             ]
 
             # 3. Stack and do a single min (or your exponential scheme)
             stacked = jnp.stack(vals, axis=-1)
-            return self._tensor_min(stacked, axis=-1)
+            return self._tensor_min(stacked, axis=-1, hardness=hardness, approx_method=approx_method)
 
         def pairwise_and(_sub_form1, _sub_form2, _path, _start_t, _end_t):
             """This can cause  brittle or localized gradient."""
             return self._tensor_min(
                 jnp.stack(
                     [
-                        self._eval(_sub_form1, _path, _start_t, _end_t),
-                        self._eval(_sub_form2, _path, _start_t, _end_t),
+                        self._eval(_sub_form1, _path, _start_t, _end_t,
+                                   hardness=hardness, approx_method=approx_method),
+                        self._eval(_sub_form2, _path, _start_t, _end_t,
+                                   hardness=hardness, approx_method=approx_method),
                     ],
                     axis=-1,
                 ),
                 axis=-1,
+                hardness=hardness, approx_method=approx_method,
             )
 
         return regular_and(sub_form1, sub_form2, path, start_t, end_t)
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY_AM)
     def _eval_or(
             self,
             sub_form1: AST,
@@ -671,48 +716,57 @@ class STL:
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
-            train_mode: bool = False
+            train_mode: bool = False,
+            hardness=None,
+            approx_method: str = None
     ) -> jnp.array:
         def regular_or(_sub_form1, _sub_form2, _path, _start_t, _end_t, _train_mode):
             subforms = self._flatten_and_or([OP_SYMBOLS["|"], sub_form1, sub_form2], flat_and=False)
 
             # 2. Evaluate each subformula
             vals = [
-                self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode)
+                self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode,
+                           hardness=hardness, approx_method=approx_method)
                 for subf in subforms
             ]
 
             # 3. Stack and do a single min (or your exponential scheme)
             stacked = jnp.stack(vals, axis=-1)
-            return self._tensor_max(stacked, axis=-1)
+            return self._tensor_max(stacked, axis=-1, hardness=hardness, approx_method=approx_method)
 
         def pairwise_or(_sub_form1, _sub_form2, _path, _start_t, _end_t):
             """This can cause  brittle or localized gradient."""
             return self._tensor_max(
                 jnp.stack(
                     [
-                        self._eval(_sub_form1, _path, _start_t, _end_t),
-                        self._eval(_sub_form2, _path, _start_t, _end_t),
+                        self._eval(_sub_form1, _path, _start_t, _end_t,
+                                   hardness=hardness, approx_method=approx_method),
+                        self._eval(_sub_form2, _path, _start_t, _end_t,
+                                   hardness=hardness, approx_method=approx_method),
                     ],
                     axis=-1,
                 ),
                 axis=-1,
+                hardness=hardness, approx_method=approx_method,
             )
 
         return regular_or(sub_form1, sub_form2, path, start_t, end_t, train_mode)
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY_AM)
     def _eval_not(
             self,
             ast: AST,
             path: jnp.array,
             start_t: int,
             end_t: int,
-            train_mode: bool = False
+            train_mode: bool = False,
+            hardness=None,
+            approx_method: str = None
     ) -> jnp.array:
-        return -self._eval(ast, path, start_t, end_t, train_mode=train_mode)
+        return -self._eval(ast, path, start_t, end_t, train_mode=train_mode,
+                           hardness=hardness, approx_method=approx_method)
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY_AM)
     def _eval_implies(
             self,
             sub_form1: AST,
@@ -720,70 +774,81 @@ class STL:
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
-            train_mode: bool = False
+            train_mode: bool = False,
+            hardness=None,
+            approx_method: str = None
     ) -> jnp.array:
         if IMPLIES_TRICK:
             return (
-                    self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode)
-                    * self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode)
+                    self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode,
+                               hardness=hardness, approx_method=approx_method)
+                    * self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode,
+                                 hardness=hardness, approx_method=approx_method)
             )
         return self._eval_or(
-            [OP_SYMBOLS["~"], sub_form1], sub_form2, path, start_t, end_t, train_mode=train_mode
+            [OP_SYMBOLS["~"], sub_form1], sub_form2, path, start_t, end_t, train_mode=train_mode,
+            hardness=hardness, approx_method=approx_method
         )
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY_AM)
     def _eval_always(
             self,
             sub_form: AST,
             path: jnp.array,
             start_t: int,
             end_t: int,
-            train_mode: bool = False
+            train_mode: bool = False,
+            hardness=None,
+            approx_method: str = None
     ) -> jnp.array:
         if self._is_leaf(sub_form):
             return self._tensor_min(
                 sub_form.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode),
-                axis=-1
+                axis=-1, hardness=hardness, approx_method=approx_method
             )
 
         # unroll always
         val_per_time = jnp.stack(
             [
-                self._eval(sub_form, path, start_t=start_t + t, end_t=end_t, train_mode=train_mode)
+                self._eval(sub_form, path, start_t=start_t + t, end_t=end_t, train_mode=train_mode,
+                           hardness=hardness, approx_method=approx_method)
                 for t in range(end_t - start_t)
             ],
             axis=-1,
         )
 
-        return self._tensor_min(val_per_time, axis=-1)
+        return self._tensor_min(val_per_time, axis=-1, hardness=hardness, approx_method=approx_method)
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY_AM)
     def _eval_eventually(
             self,
             sub_form: AST,
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
-            train_mode: bool = False
+            train_mode: bool = False,
+            hardness=None,
+            approx_method: str = None
     ) -> jnp.array:
         if self._is_leaf(sub_form):
             return self._tensor_max(
                 sub_form.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode),
-                axis=-1
+                axis=-1, hardness=hardness, approx_method=approx_method
             )
 
         # unroll eventually
         val_per_time = jnp.stack(
             [
-                self._eval(sub_form, path, start_t=start_t + t, end_t=end_t, train_mode=train_mode)
+                self._eval(sub_form, path, start_t=start_t + t, end_t=end_t, train_mode=train_mode,
+                           hardness=hardness, approx_method=approx_method)
                 for t in range(end_t - start_t)
             ],
             axis=-1,
         )
 
-        return self._tensor_max(val_per_time, axis=-1)
+        return self._tensor_max(val_per_time, axis=-1, hardness=hardness, approx_method=approx_method)
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY_AM)
     def _eval_until(
             self,
             sub_form1: AST,
@@ -791,7 +856,9 @@ class STL:
             path: jnp.array,
             start_t: int = 0,
             end_t: int = None,
-            train_mode: bool = False
+            train_mode: bool = False,
+            hardness=None,
+            approx_method: str = None
     ) -> jnp.array:
         # Standard STL until robustness:
         #   ρ(φ₁ U_[start_t, end_t) φ₂)
@@ -806,7 +873,7 @@ class STL:
             return jnp.stack(
                 [
                     self._eval(sub_form, path, start_t=start_t + t, end_t=end_t,
-                               train_mode=train_mode)
+                               train_mode=train_mode, hardness=hardness, approx_method=approx_method)
                     for t in range(end_t - start_t)
                 ],
                 axis=-1,
@@ -820,8 +887,9 @@ class STL:
         sentinel = jnp.full(f1_cum.shape[:-1] + (1,), 1e9, dtype=f1_cum.dtype)
         f1_cum_excl = jnp.concatenate([sentinel, f1_cum[..., :-1]], axis=-1)
 
-        per_t = self._tensor_min(jnp.stack([f1_cum_excl, f2], axis=-1), axis=-1)
-        return self._tensor_max(per_t, axis=-1)
+        per_t = self._tensor_min(jnp.stack([f1_cum_excl, f2], axis=-1), axis=-1,
+                                 hardness=hardness, approx_method=approx_method)
+        return self._tensor_max(per_t, axis=-1, hardness=hardness, approx_method=approx_method)
 
     def get_stlpy_form(self):
         # catch already converted form
@@ -895,13 +963,26 @@ class STL:
                 return True
         return issubclass(type(ast), PredicateBase)
 
-    def _tensor_min(self, tensor: jnp.array, axis=-1) -> jnp.array:
-        ratio = softmax(tensor * -HARDNESS, axis=axis)
-        return jnp.sum(tensor * ratio, axis=axis)
+    def _tensor_max(self, tensor: jnp.array, axis=-1, hardness=None,
+                    approx_method: str = None) -> jnp.array:
+        """Soft max over `axis`. hardness=None -> module HARDNESS; approx_method=None -> APPROX_METHOD."""
+        if hardness is None:
+            hardness = HARDNESS
+        if approx_method is None:
+            approx_method = APPROX_METHOD
+        if approx_method == "softmax":  # legacy weighted-sum (biased <= true max)
+            ratio = softmax(tensor * hardness, axis=axis)
+            return jnp.sum(tensor * ratio, axis=axis)
+        elif approx_method == "logsumexp":  # mass-conserving smooth max, -> true max as h -> inf
+            return logsumexp(hardness * tensor, axis=axis) / hardness
+        elif approx_method == "true":  # exact; jax spreads grad across argmax ties
+            return jnp.max(tensor, axis=axis)
+        raise ValueError(f"Unknown approx_method {approx_method!r}")
 
-    def _tensor_max(self, tensor: jnp.array, axis=-1) -> jnp.array:
-        ratio = softmax(tensor * HARDNESS, axis=axis)
-        return jnp.sum(tensor * ratio, axis=axis)
+    def _tensor_min(self, tensor: jnp.array, axis=-1, hardness=None,
+                    approx_method: str = None) -> jnp.array:
+        """Soft min via min(x) = -max(-x); identity holds for all three approx methods."""
+        return -self._tensor_max(-tensor, axis=axis, hardness=hardness, approx_method=approx_method)
 
     def simplify(self):
         if self.stlpy_form is None:

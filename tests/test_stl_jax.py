@@ -267,5 +267,199 @@ class TestUntilSemantics(unittest.TestCase):
         self.assertGreater(rho, 0, f"JAX nested until should be positive, got {rho}")
 
 
+import ds.stl_jax as stl_jax
+
+
+class TestApproxMethodsUnit(unittest.TestCase):
+    """Unit tests for the approx_method switch on _tensor_min / _tensor_max.
+
+    Three methods: "softmax" (legacy default, weighted-sum), "logsumexp"
+    (mass-conserving smooth max), "true" (exact jnp.max/min, gradient
+    distributed across ties). hardness/approx_method are per-call overrides.
+    """
+
+    def setUp(self):
+        os.environ["DIFF_STL_BACKEND"] = "jax"
+        importlib.reload(ds_utils)
+        self.form = STL(RectReachPredicate(np.array([0, 0]), np.array([2, 2]), "p"))
+        self.arr = jnp.array([0.1, -0.3, 0.5, -0.2, 0.05])
+        self._orig_hardness = stl_jax.HARDNESS
+        self._orig_method = stl_jax.APPROX_METHOD
+
+    def tearDown(self):
+        stl_jax.HARDNESS = self._orig_hardness
+        stl_jax.APPROX_METHOD = self._orig_method
+
+    def test_true_equals_exact(self):
+        """approx_method='true' is bit-for-bit jnp.max / jnp.min."""
+        mx = self.form._tensor_max(self.arr, axis=-1, approx_method="true")
+        mn = self.form._tensor_min(self.arr, axis=-1, approx_method="true")
+        self.assertAlmostEqual(float(mx), float(jnp.max(self.arr)), places=6)
+        self.assertAlmostEqual(float(mn), float(jnp.min(self.arr)), places=6)
+
+    def test_ordering_inequalities(self):
+        """softmax_max <= true_max <= logsumexp_max ; mins reversed."""
+        h = 10.0
+        smax = float(self.form._tensor_max(self.arr, hardness=h, approx_method="softmax"))
+        tmax = float(self.form._tensor_max(self.arr, hardness=h, approx_method="true"))
+        lmax = float(self.form._tensor_max(self.arr, hardness=h, approx_method="logsumexp"))
+        self.assertLessEqual(smax, tmax + 1e-6)
+        self.assertLessEqual(tmax, lmax + 1e-6)
+        smin = float(self.form._tensor_min(self.arr, hardness=h, approx_method="softmax"))
+        tmin = float(self.form._tensor_min(self.arr, hardness=h, approx_method="true"))
+        lmin = float(self.form._tensor_min(self.arr, hardness=h, approx_method="logsumexp"))
+        self.assertGreaterEqual(smin, tmin - 1e-6)
+        self.assertGreaterEqual(tmin, lmin - 1e-6)
+
+    def test_default_is_legacy_softmax(self):
+        """Default (no override) must equal the legacy softmax-weighted-sum formula."""
+        from jax.nn import softmax
+        h = stl_jax.HARDNESS
+        legacy_max = float(jnp.sum(self.arr * softmax(self.arr * h, axis=-1), axis=-1))
+        legacy_min = float(jnp.sum(self.arr * softmax(self.arr * -h, axis=-1), axis=-1))
+        self.assertAlmostEqual(float(self.form._tensor_max(self.arr)), legacy_max, places=5)
+        self.assertAlmostEqual(float(self.form._tensor_min(self.arr)), legacy_min, places=5)
+
+    def test_hardness_override_is_live(self):
+        """Higher hardness pulls softmax-max toward the true max (proves arg is used)."""
+        lo = float(self.form._tensor_max(self.arr, hardness=1.0, approx_method="softmax"))
+        hi = float(self.form._tensor_max(self.arr, hardness=100.0, approx_method="softmax"))
+        true = float(jnp.max(self.arr))
+        self.assertLess(abs(hi - true), abs(lo - true))
+
+    def test_gradient_finite_all_methods(self):
+        for m in ("softmax", "logsumexp", "true"):
+            g = jax.grad(lambda a: self.form._tensor_max(a, hardness=10.0, approx_method=m))(self.arr)
+            self.assertTrue(bool(jnp.isfinite(g).all()), f"{m} max grad non-finite")
+            g2 = jax.grad(lambda a: self.form._tensor_min(a, hardness=10.0, approx_method=m))(self.arr)
+            self.assertTrue(bool(jnp.isfinite(g2).all()), f"{m} min grad non-finite")
+
+    def test_invalid_method_raises(self):
+        with self.assertRaises((ValueError, KeyError)):
+            float(self.form._tensor_max(self.arr, approx_method="bogus"))
+
+
+class TestApproxMethodsEval(unittest.TestCase):
+    """End-to-end: per-call hardness/approx_method flow through eval into nested temporal ops."""
+
+    def setUp(self):
+        os.environ["DIFF_STL_BACKEND"] = "jax"
+        importlib.reload(ds_utils)
+        self.phi1 = STL(RectReachPredicate(np.array([0, 0]), np.array([2, 2]), "phi1"))
+        self.phi2 = STL(RectReachPredicate(np.array([4, 4]), np.array([2, 2]), "phi2"))
+        self.T = 11
+        self.until_form = self.phi1.until(self.phi2, 0, self.T - 1)
+        # stl_mixin-style compound nested temporal (eventually & eventually).always
+        g0 = STL(RectReachPredicate(np.array([0, 0]), np.array([1, 1]), "g0"))
+        g1 = STL(RectReachPredicate(np.array([2, 2]), np.array([1, 1]), "g1"))
+        self.compound = (g0.eventually(0, 5) & g1.eventually(0, 5)).always(0, 8)
+        self._orig_method = stl_jax.APPROX_METHOD
+
+    def tearDown(self):
+        stl_jax.APPROX_METHOD = self._orig_method
+
+    def _path(self, pts):
+        return ds_utils.default_tensor(np.array(pts, dtype=np.float32)[None])
+
+    @property
+    def _sat(self):
+        return self._path([[0, 0]] * 5 + [[4, 4]] * 6)
+
+    @property
+    def _unsat(self):
+        return self._path([[0, 0]] * self.T)  # never reaches phi2
+
+    def test_sign_all_methods(self):
+        """until sign correctness preserved under every approx_method."""
+        for m in ("softmax", "logsumexp", "true"):
+            sat = float(self.until_form.eval(self._sat, approx_method=m).squeeze())
+            uns = float(self.until_form.eval(self._unsat, approx_method=m).squeeze())
+            self.assertGreater(sat, 0, f"{m}: sat should be > 0, got {sat}")
+            self.assertLess(uns, 0, f"{m}: unsat should be < 0, got {uns}")
+
+    def test_default_matches_explicit_softmax(self):
+        """Backward-compat: no-arg eval == explicit softmax at module HARDNESS."""
+        d = float(self.until_form.eval(self._sat).squeeze())
+        e = float(self.until_form.eval(
+            self._sat, hardness=stl_jax.HARDNESS, approx_method="softmax").squeeze())
+        self.assertAlmostEqual(d, e, places=5)
+
+    def test_approx_override_propagates(self):
+        """softmax vs true differ on a varied robustness trace -> approx_method override
+        reaches the temporal reduction (eventually). true (exact max) >= softmax-weighted."""
+        goal = STL(RectReachPredicate(np.array([4, 4]), np.array([2, 2]), "gr"))
+        form = goal.eventually(0, 10)
+        ramp = self._path([[i * 0.4, i * 0.4] for i in range(11)])  # [0,0] -> [4,4]
+        soft = float(form.eval(ramp, hardness=2.0, approx_method="softmax").squeeze())
+        true = float(form.eval(ramp, hardness=2.0, approx_method="true").squeeze())
+        self.assertTrue(np.isfinite(soft) and np.isfinite(true))
+        self.assertNotAlmostEqual(soft, true, places=3)
+        self.assertGreaterEqual(true, soft - 1e-6)
+
+    def test_hardness_override_reaches_nested(self):
+        """Varying hardness changes the compound value -> hardness propagated into nested ops."""
+        path = self._path([[0.5, 0.5], [1.5, 1.5]] * 4 + [[1.0, 1.0]])
+        lo = float(self.compound.eval(path, hardness=1.0, approx_method="softmax").squeeze())
+        hi = float(self.compound.eval(path, hardness=100.0, approx_method="softmax").squeeze())
+        self.assertNotAlmostEqual(lo, hi, places=3)
+
+    def test_hardness_is_traced_arg(self):
+        """A traced hardness scalar varies output without error (single-trace dynamic arg)."""
+        vals = [float(self.until_form.eval(self._sat, hardness=jnp.asarray(h),
+                                           approx_method="logsumexp").squeeze())
+                for h in (1.0, 5.0, 50.0)]
+        self.assertGreaterEqual(len(set(np.round(vals, 4))), 2, f"hardness not live: {vals}")
+
+    def test_module_global_opt_in(self):
+        """Setting ds.stl_jax.APPROX_METHOD before .eval is honored (stl_mixin opt-in pattern)."""
+        stl_jax.APPROX_METHOD = "true"
+        try:
+            v_global = float(self.until_form.eval(self._sat).squeeze())
+        finally:
+            stl_jax.APPROX_METHOD = self._orig_method
+        v_explicit = float(self.until_form.eval(self._sat, approx_method="true").squeeze())
+        self.assertAlmostEqual(v_global, v_explicit, places=5)
+
+    def test_gradient_flows_each_method(self):
+        for m in ("softmax", "logsumexp", "true"):
+            g = jax.grad(lambda p: self.until_form.eval(
+                p, hardness=20.0, approx_method=m).mean())(self._sat)
+            self.assertTrue(bool(jnp.isfinite(g).all()), f"{m}: grad non-finite")
+
+
+class TestPerStepSchedule(unittest.TestCase):
+    """Soft/dense early -> sharp logsumexp late: logsumexp crosses the boundary
+    where softmax-weighted-sum plateaus, at the same hardness."""
+
+    def setUp(self):
+        os.environ["DIFF_STL_BACKEND"] = "jax"
+        importlib.reload(ds_utils)
+        self.goal = STL(RectReachPredicate(np.array([4, 4]), np.array([2, 2]), "g"))
+        self.form = self.goal.eventually(0, 10)
+
+    def _optimize(self, method, hardness, steps=150, lr=0.2):
+        import optax
+        T = 11
+        path0 = ds_utils.default_tensor(np.full((1, T, 2), 10.0, dtype=np.float32))
+        loss = lambda p: -self.form.eval(p, hardness=hardness, approx_method=method).mean()
+        opt = optax.adam(lr)
+        st = opt.init(path0)
+        p = path0
+        best = float(-loss(p))
+        for _ in range(steps):
+            g = jax.grad(loss)(p)
+            u, st = opt.update(g, st)
+            p = optax.apply_updates(p, u)
+            best = max(best, float(-loss(p)))
+        return best
+
+    def test_logsumexp_crosses_boundary(self):
+        """logsumexp reaches satisfaction and is no worse than softmax at the same hardness."""
+        soft = self._optimize("softmax", hardness=10.0)
+        lse = self._optimize("logsumexp", hardness=10.0)
+        self.assertGreater(lse, 0.0, f"logsumexp should reach sat robustness, got {lse}")
+        self.assertGreaterEqual(lse, soft - 1e-3, f"logsumexp={lse} softmax={soft}")
+
+
 if __name__ == '__main__':
     unittest.main()
