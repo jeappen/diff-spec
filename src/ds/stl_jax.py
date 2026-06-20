@@ -411,19 +411,16 @@ def list_to_tuple(x):
     return x
 
 
-# Shared by ds.ma_stl_jax (imported via `from .stl_jax import *`); its jitted _eval
-# methods have the original 6/7-arg signatures, so these must stay as-is.
-STATIC_ARGNUMS_UNARY = (0, 1, 3, 4, 5)
-STATIC_ARGNUMS_BINARY = (0, 1, 2, 4, 5, 6)
-
-# stl_jax-only: eval fns additionally take ..., hardness (dynamic/traced), approx_method (static).
-# UNARY_AM  sig: (self, ast,  path, start_t, end_t, train_mode, hardness, approx_method)
-#                  0    1     2     3        4      5           6         7
-# BINARY_AM sig: (self, sf1, sf2,  path, start_t, end_t, train_mode, hardness, approx_method)
-#                  0    1    2     3     4        5      6           7         8
+# Static (compile-time) arg positions for the jitted _eval* methods, shared by
+# ds.stl_jax (STL) and ds.ma_stl_jax (CaTLPlus, via `from .stl_jax import *`).
+# Both engines use the same signature:
+#   UNARY  (self, ast,      path, start_t, end_t, train_mode, hardness, approx_method)
+#           0    1          2     3        4      5           6         7
+#   BINARY (self, sf1, sf2, path, start_t, end_t, train_mode, hardness, approx_method)
+#           0    1    2     3     4        5      6           7         8
 # hardness stays dynamic (vary per step, no retrace); approx_method is static.
-STATIC_ARGNUMS_UNARY_AM = (0, 1, 3, 4, 5, 7)
-STATIC_ARGNUMS_BINARY_AM = (0, 1, 2, 4, 5, 6, 8)
+STATIC_ARGNUMS_UNARY = (0, 1, 3, 4, 5, 7)
+STATIC_ARGNUMS_BINARY = (0, 1, 2, 4, 5, 6, 8)
 
 
 class STL:
@@ -597,7 +594,7 @@ class STL:
         # Is binary operator
         return max(self._get_end_time(ast[1]), self._get_end_time(ast[2]))
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY_AM)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval(
             self,
             ast: AST,
@@ -663,7 +660,7 @@ class STL:
                 result.append(node)
         return result
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY_AM)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_and(
             self,
             sub_form1: AST,
@@ -708,7 +705,7 @@ class STL:
 
         return regular_and(sub_form1, sub_form2, path, start_t, end_t)
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY_AM)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_or(
             self,
             sub_form1: AST,
@@ -752,7 +749,7 @@ class STL:
 
         return regular_or(sub_form1, sub_form2, path, start_t, end_t, train_mode)
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY_AM)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval_not(
             self,
             ast: AST,
@@ -766,7 +763,7 @@ class STL:
         return -self._eval(ast, path, start_t, end_t, train_mode=train_mode,
                            hardness=hardness, approx_method=approx_method)
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY_AM)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_implies(
             self,
             sub_form1: AST,
@@ -790,7 +787,7 @@ class STL:
             hardness=hardness, approx_method=approx_method
         )
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY_AM)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval_always(
             self,
             sub_form: AST,
@@ -819,7 +816,7 @@ class STL:
 
         return self._tensor_min(val_per_time, axis=-1, hardness=hardness, approx_method=approx_method)
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY_AM)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
     def _eval_eventually(
             self,
             sub_form: AST,
@@ -848,7 +845,7 @@ class STL:
 
         return self._tensor_max(val_per_time, axis=-1, hardness=hardness, approx_method=approx_method)
 
-    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY_AM)
+    @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_until(
             self,
             sub_form1: AST,

@@ -346,5 +346,101 @@ class TestCaTLPlusUntilSemantics(unittest.TestCase):
         self.assertLess(float(form.eval(bad_path)), 0)
 
 
+import ds.ma_stl_jax as ma_stl_jax
+
+
+class TestCaTLPlusApproxMethods(unittest.TestCase):
+    """Per-call hardness/approx_method threading on CaTLPlus.eval.
+
+    CaTLPlus has two default hardness sources: ma_stl_jax.HARDNESS for the
+    CaTLPlus-level soft reductions, and stl_jax.HARDNESS for the STL inside
+    each Task. Threading is lazy (None -> each level's own global) so the
+    no-arg path stays byte-identical; explicit values override everything
+    (CaTLPlus ops AND the inner STL).
+    """
+
+    def setUp(self):
+        os.environ["DIFF_STL_BACKEND"] = "jax"
+        importlib.reload(ds_utils)
+        self.T = 11
+        phi1 = STL(RectReachPredicate(np.array([0, 0]), np.array([2, 2]), "phi1"))
+        phi2 = STL(RectReachPredicate(np.array([4, 4]), np.array([2, 2]), "phi2"))
+        self.A = CaTLPlus(Task(10, phi1, 1, None))
+        self.B = CaTLPlus(Task(11, phi2, 1, None))
+        self.until_form = self.A.until(self.B, 0, self.T - 1)
+        # Task wrapping an inner-STL eventually — exercises threading through Task -> STL.
+        goal = STL(RectReachPredicate(np.array([4, 4]), np.array([2, 2]), "g"))
+        self.inner_temporal = CaTLPlus(Task(12, goal.eventually(0, self.T - 1), 1, None))
+        self._orig_method = ma_stl_jax.APPROX_METHOD
+
+    def tearDown(self):
+        ma_stl_jax.APPROX_METHOD = self._orig_method
+
+    def _path(self, pts):
+        # CaTLPlus path is (num_agents, T, d); single agent here.
+        return ds_utils.default_tensor(np.array(pts, dtype=np.float32)[None])
+
+    @property
+    def _sat(self):
+        return self._path([[0, 0]] * 5 + [[4, 4]] * 6)
+
+    @property
+    def _unsat(self):
+        return self._path([[0, 0]] * self.T)
+
+    def test_default_matches_explicit_softmax(self):
+        """no-arg eval == explicit approx='softmax' (hardness left lazy) -> approx default unchanged."""
+        d = float(self.until_form.eval(self._sat))
+        e = float(self.until_form.eval(self._sat, approx_method="softmax"))
+        self.assertAlmostEqual(d, e, places=5)
+
+    def test_train_mode_default_unchanged(self):
+        """Exponential-robustness (scoring) path unchanged by default approx."""
+        d = float(self.until_form.eval_train(self._sat))
+        e = float(self.until_form.eval_train(self._sat, approx_method="softmax"))
+        self.assertAlmostEqual(d, e, places=5)
+        self.assertTrue(np.isfinite(d))
+
+    def test_sign_all_methods(self):
+        for m in ("softmax", "logsumexp", "true"):
+            sat = float(self.until_form.eval(self._sat, approx_method=m))
+            uns = float(self.until_form.eval(self._unsat, approx_method=m))
+            self.assertGreater(sat, 0, f"{m}: sat should be > 0, got {sat}")
+            self.assertLess(uns, 0, f"{m}: unsat should be < 0, got {uns}")
+
+    def test_approx_propagates_into_inner_stl(self):
+        """softmax vs true differ on a Task's inner-STL eventually -> threading reaches STL."""
+        ramp = self._path([[i * 0.4, i * 0.4] for i in range(self.T)])
+        soft = float(self.inner_temporal.eval(ramp, hardness=2.0, approx_method="softmax"))
+        true = float(self.inner_temporal.eval(ramp, hardness=2.0, approx_method="true"))
+        self.assertTrue(np.isfinite(soft) and np.isfinite(true))
+        self.assertNotAlmostEqual(soft, true, places=3)
+
+    def test_hardness_override_is_live(self):
+        """Varying hardness changes until robustness -> hardness reaches CaTLPlus _tensor_*."""
+        lo = float(self.until_form.eval(self._sat, hardness=1.0))
+        hi = float(self.until_form.eval(self._sat, hardness=100.0))
+        self.assertNotAlmostEqual(lo, hi, places=3)
+
+    def test_module_global_opt_in(self):
+        """Set ds.ma_stl_jax.APPROX_METHOD before first trace of a fresh form -> honored."""
+        phi1 = STL(RectReachPredicate(np.array([0, 0]), np.array([2, 2]), "phi1"))
+        phi2 = STL(RectReachPredicate(np.array([4, 4]), np.array([2, 2]), "phi2"))
+        ma_stl_jax.APPROX_METHOD = "true"
+        try:
+            fresh = CaTLPlus(Task(10, phi1, 1, None)).until(CaTLPlus(Task(11, phi2, 1, None)),
+                                                            0, self.T - 1)
+            v_global = float(fresh.eval(self._sat))
+        finally:
+            ma_stl_jax.APPROX_METHOD = self._orig_method
+        v_explicit = float(self.until_form.eval(self._sat, approx_method="true"))
+        self.assertAlmostEqual(v_global, v_explicit, places=5)
+
+    def test_gradient_flows_each_method(self):
+        for m in ("softmax", "logsumexp", "true"):
+            g = jax.grad(lambda p: self.until_form.eval(p, hardness=20.0, approx_method=m))(self._sat)
+            self.assertTrue(bool(jnp.isfinite(g).all()), f"{m}: grad non-finite")
+
+
 if __name__ == '__main__':
     unittest.main()
