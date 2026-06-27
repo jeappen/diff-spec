@@ -37,8 +37,10 @@ import re
 class PredicateBase(NamedTuple):
     name: int
 
-    def eval_at_t(self, path: jnp.ndarray, t: int = 0, train_mode: bool = False) -> jnp.ndarray:
-        return self.eval_whole_path(path, t, t + 1, train_mode=train_mode)[:, 0]
+    def eval_at_t(self, path: jnp.ndarray, t: int = 0, train_mode: bool = False,
+                  cent_override=None) -> jnp.ndarray:
+        return self.eval_whole_path(path, t, t + 1, train_mode=train_mode,
+                                    cent_override=cent_override)[:, 0]
 
     @abstractmethod
     def eval_whole_path(
@@ -79,8 +81,10 @@ class RectangularPredicate(NamedTuple):
     def cent_tensor(self):
         return ds_utils.default_tensor(self.cent)
 
-    def eval_at_t(self, path: jnp.ndarray, t: int = 0, train_mode: bool = False) -> jnp.ndarray:
-        return self.eval_whole_path(path, t, t + 1, train_mode=train_mode)[:, 0]
+    def eval_at_t(self, path: jnp.ndarray, t: int = 0, train_mode: bool = False,
+                  cent_override=None) -> jnp.ndarray:
+        return self.eval_whole_path(path, t, t + 1, train_mode=train_mode,
+                                    cent_override=cent_override)[:, 0]
 
     @abstractmethod
     def eval_whole_path(
@@ -147,11 +151,26 @@ class RectReachPredicate(RectangularPredicate):
     """
 
     def eval_whole_path(
-            self, path: jnp.array, start_t: int = 0, end_t: int = None, train_mode: bool = False
+            self, path: jnp.array, start_t: int = 0, end_t: int = None, train_mode: bool = False,
+            cent_override=None
     ) -> jnp.array:
-        """Stick to JAX when possible."""
+        """Stick to JAX when possible.
+
+        :param cent_override: optional traced center source. When provided (and this
+            predicate has a non-negative ``name``, i.e. it is a real goal, not a
+            boundary predicate), the rectangle center is read from
+            ``cent_override[self.name]`` (a traced array) instead of the baked
+            ``self.cent``. This lets the goal coordinates flow as a *dynamic* jit
+            argument so changing them does not retrigger compilation, while the
+            formula structure stays static. ``None`` reproduces the original
+            behaviour exactly.
+        """
         assert len(path.shape) == 3, "motion must be in batch"
         eval_path = path[:, start_t:end_t]
+        if cent_override is not None and self.name >= 0:
+            _cent = ds_utils.default_tensor(cent_override[self.name])
+        else:
+            _cent = self.cent_tensor
 
         def with_shrink(_eval_path):
             """L-SHRINK_NORM Norm version for conservative evaluation"""
@@ -162,7 +181,7 @@ class RectReachPredicate(RectangularPredicate):
                 shrink_multiplier = 1
             return jnp.linalg.norm(self.size_tensor * self.shrink_factor * shrink_multiplier / 2,
                                    ord=SHRINK_NORM) - jnp.linalg.norm(
-                _eval_path - self.cent_tensor, axis=-1, ord=SHRINK_NORM)
+                _eval_path - _cent, axis=-1, ord=SHRINK_NORM)
             # # Adding shrink factor to make it more conservative
             # # self.size_tensor * ( 0.2  / 2) - jnp.abs(_eval_path - self.cent_tensor), axis=-1
             # # jnp.linalg.norm(self.size_tensor * 0.6 / 2) - jnp.linalg.norm(_eval_path - self.cent_tensor, axis=-1)
@@ -179,7 +198,7 @@ class RectReachPredicate(RectangularPredicate):
 
         def without_shrink(_eval_path):
             return jnp.min(
-                self.size_tensor / 2 - jnp.abs(_eval_path - self.cent_tensor), axis=-1
+                self.size_tensor / 2 - jnp.abs(_eval_path - _cent), axis=-1
             )
 
         res = jax.lax.cond(train_mode, with_shrink, without_shrink, eval_path)
@@ -208,9 +227,14 @@ class RectAvoidPredicate(RectangularPredicate):
 
     def eval_whole_path(
             self, path: jnp.array, start_t: int = 0, end_t: int = None,
-            train_mode: bool = False
+            train_mode: bool = False, cent_override=None
     ) -> jnp.array:
-        """Stick to JAX when possible."""
+        """Stick to JAX when possible.
+
+        ``cent_override`` is accepted for signature compatibility (``_eval`` forwards
+        it to every leaf) but intentionally IGNORED: avoid predicates are obstacles,
+        not the goals being randomized, so they keep their baked center.
+        """
         assert len(path.shape) == 3, "motion must be in batch"
         eval_path = path[:, start_t:end_t]
 
@@ -477,7 +501,7 @@ class STL:
         return STL(ast)
 
     def eval(self, path: jnp.array, t: int = 0, train_mode: bool = False,
-             hardness=None, approx_method: str = None) -> jnp.array:
+             hardness=None, approx_method: str = None, cent_override=None) -> jnp.array:
         """Evaluate the formula at time t.
 
         :param path:            The motion path to evaluate the formula on.
@@ -497,13 +521,15 @@ class STL:
         if approx_method is None:
             approx_method = APPROX_METHOD
         return self._eval(self.tuple_ast, path, t, train_mode=train_mode,
-                          hardness=hardness, approx_method=approx_method)
+                          hardness=hardness, approx_method=approx_method,
+                          cent_override=cent_override)
 
     def eval_train(self, path: jnp.array, t: int = 0,
-                   hardness=None, approx_method: str = None) -> jnp.array:
+                   hardness=None, approx_method: str = None, cent_override=None) -> jnp.array:
         """To help prevent recompilation in jax.jit, we separate the training mode evaluation."""
         return self.eval(path, t, train_mode=True,
-                         hardness=hardness, approx_method=approx_method)
+                         hardness=hardness, approx_method=approx_method,
+                         cent_override=cent_override)
 
     def end_time(self) -> int:
         """Get the end time of the formula efficiently."""
@@ -538,10 +564,12 @@ class STL:
             end_t: int = None,
             train_mode: bool = False,
             hardness=None,
-            approx_method: str = None
+            approx_method: str = None,
+            cent_override=None
     ) -> jnp.array:
         if self._is_leaf(ast):
-            return ast.eval_at_t(path, start_t, train_mode=train_mode)
+            return ast.eval_at_t(path, start_t, train_mode=train_mode,
+                                 cent_override=cent_override)
 
         op_code = ast[0]
         if op_code in self.sequence_operators:
@@ -550,7 +578,8 @@ class STL:
             if end_t > path.shape[1]:
                 self.logger.warning("end_t is larger than motion length")
 
-        kw = dict(train_mode=train_mode, hardness=hardness, approx_method=approx_method)
+        kw = dict(train_mode=train_mode, hardness=hardness, approx_method=approx_method,
+                  cent_override=cent_override)
         if op_code == OP_SYMBOLS["&"]:
             return self._eval_and(ast[1], ast[2], path, start_t, end_t, **kw)
         elif op_code == OP_SYMBOLS["|"]:
@@ -605,7 +634,8 @@ class STL:
             end_t: int = None,
             train_mode: bool = False,
             hardness=None,
-            approx_method: str = None
+            approx_method: str = None,
+            cent_override=None
     ) -> jnp.array:
         def regular_and(_sub_form1, _sub_form2, _path, _start_t, _end_t):
             _train_mode = False
@@ -614,7 +644,8 @@ class STL:
             # 2. Evaluate each subformula
             vals = [
                 self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode,
-                           hardness=hardness, approx_method=approx_method)
+                           hardness=hardness, approx_method=approx_method,
+                           cent_override=cent_override)
                 for subf in subforms
             ]
 
@@ -634,7 +665,8 @@ class STL:
             end_t: int = None,
             train_mode: bool = False,
             hardness=None,
-            approx_method: str = None
+            approx_method: str = None,
+            cent_override=None
     ) -> jnp.array:
         def regular_or(_sub_form1, _sub_form2, _path, _start_t, _end_t, _train_mode):
             subforms = self._flatten_and_or([OP_SYMBOLS["|"], sub_form1, sub_form2], flat_and=False)
@@ -642,7 +674,8 @@ class STL:
             # 2. Evaluate each subformula
             vals = [
                 self._eval(subf, _path, _start_t, _end_t, train_mode=_train_mode,
-                           hardness=hardness, approx_method=approx_method)
+                           hardness=hardness, approx_method=approx_method,
+                           cent_override=cent_override)
                 for subf in subforms
             ]
 
@@ -661,10 +694,12 @@ class STL:
             end_t: int,
             train_mode: bool = False,
             hardness=None,
-            approx_method: str = None
+            approx_method: str = None,
+            cent_override=None
     ) -> jnp.array:
         return -self._eval(ast, path, start_t, end_t, train_mode=train_mode,
-                           hardness=hardness, approx_method=approx_method)
+                           hardness=hardness, approx_method=approx_method,
+                           cent_override=cent_override)
 
     @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_BINARY)
     def _eval_implies(
@@ -676,18 +711,21 @@ class STL:
             end_t: int = None,
             train_mode: bool = False,
             hardness=None,
-            approx_method: str = None
+            approx_method: str = None,
+            cent_override=None
     ) -> jnp.array:
         if IMPLIES_TRICK:
             return (
                     self._eval(sub_form1, path, start_t, end_t, train_mode=train_mode,
-                               hardness=hardness, approx_method=approx_method)
+                               hardness=hardness, approx_method=approx_method,
+                               cent_override=cent_override)
                     * self._eval(sub_form2, path, start_t, end_t, train_mode=train_mode,
-                                 hardness=hardness, approx_method=approx_method)
+                                 hardness=hardness, approx_method=approx_method,
+                                 cent_override=cent_override)
             )
         return self._eval_or(
             [OP_SYMBOLS["~"], sub_form1], sub_form2, path, start_t, end_t, train_mode=train_mode,
-            hardness=hardness, approx_method=approx_method
+            hardness=hardness, approx_method=approx_method, cent_override=cent_override
         )
 
     @ft.partial(jax.jit, static_argnums=STATIC_ARGNUMS_UNARY)
@@ -699,11 +737,13 @@ class STL:
             end_t: int,
             train_mode: bool = False,
             hardness=None,
-            approx_method: str = None
+            approx_method: str = None,
+            cent_override=None
     ) -> jnp.array:
         if self._is_leaf(sub_form):
             return self._tensor_min(
-                sub_form.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode),
+                sub_form.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode,
+                                         cent_override=cent_override),
                 axis=-1, hardness=hardness, approx_method=approx_method
             )
 
@@ -711,7 +751,8 @@ class STL:
         val_per_time = jnp.stack(
             [
                 self._eval(sub_form, path, start_t=start_t + t, end_t=end_t, train_mode=train_mode,
-                           hardness=hardness, approx_method=approx_method)
+                           hardness=hardness, approx_method=approx_method,
+                           cent_override=cent_override)
                 for t in range(end_t - start_t)
             ],
             axis=-1,
@@ -728,11 +769,13 @@ class STL:
             end_t: int = None,
             train_mode: bool = False,
             hardness=None,
-            approx_method: str = None
+            approx_method: str = None,
+            cent_override=None
     ) -> jnp.array:
         if self._is_leaf(sub_form):
             return self._tensor_max(
-                sub_form.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode),
+                sub_form.eval_whole_path(path[:, start_t:end_t], train_mode=train_mode,
+                                         cent_override=cent_override),
                 axis=-1, hardness=hardness, approx_method=approx_method
             )
 
@@ -740,7 +783,8 @@ class STL:
         val_per_time = jnp.stack(
             [
                 self._eval(sub_form, path, start_t=start_t + t, end_t=end_t, train_mode=train_mode,
-                           hardness=hardness, approx_method=approx_method)
+                           hardness=hardness, approx_method=approx_method,
+                           cent_override=cent_override)
                 for t in range(end_t - start_t)
             ],
             axis=-1,
@@ -758,7 +802,8 @@ class STL:
             end_t: int = None,
             train_mode: bool = False,
             hardness=None,
-            approx_method: str = None
+            approx_method: str = None,
+            cent_override=None
     ) -> jnp.array:
         # Standard STL until robustness:
         #   ρ(φ₁ U_[start_t, end_t) φ₂)
@@ -769,11 +814,13 @@ class STL:
         def unroll(sub_form):
             if self._is_leaf(sub_form):
                 return sub_form.eval_whole_path(path[:, start_t:end_t],
-                                                train_mode=train_mode)
+                                                train_mode=train_mode,
+                                                cent_override=cent_override)
             return jnp.stack(
                 [
                     self._eval(sub_form, path, start_t=start_t + t, end_t=end_t,
-                               train_mode=train_mode, hardness=hardness, approx_method=approx_method)
+                               train_mode=train_mode, hardness=hardness, approx_method=approx_method,
+                               cent_override=cent_override)
                     for t in range(end_t - start_t)
                 ],
                 axis=-1,
