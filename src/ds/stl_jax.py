@@ -205,10 +205,19 @@ class RectReachPredicate(RectangularPredicate):
 
         return res
 
-    def get_stlpy_form(self) -> STLTree:
-        """Use Numpy to ensure compatibility with STLpy."""
+    def get_stlpy_form(self, cent_override=None) -> STLTree:
+        """Use Numpy to ensure compatibility with STLpy.
+
+        ``cent_override``: optional per-goal center array (e.g. resampled random goals).
+        When provided and this is a real goal (``name >= 0``), the MILP box is centered
+        on ``cent_override[self.name]`` instead of the baked ``self.cent`` -- so STLPY
+        solves the SAME random goals the diffusion guidance uses, on the same formula.
+        """
+        cent = self.cent
+        if cent_override is not None and self.name >= 0:
+            cent = np.asarray(cent_override[self.name], dtype=np.float64)
         bounds = np.stack(
-            [self.cent - self.size * self.shrink_factor / 2, self.cent + self.size * self.shrink_factor / 2]
+            [cent - self.size * self.shrink_factor / 2, cent + self.size * self.shrink_factor / 2]
         ).T.flatten()
         return inside_npy(bounds, 0, 1, 2, self.name)
 
@@ -838,68 +847,73 @@ class STL:
                                  hardness=hardness, approx_method=approx_method)
         return self._tensor_max(per_t, axis=-1, hardness=hardness, approx_method=approx_method)
 
-    def get_stlpy_form(self):
+    def get_stlpy_form(self, cent_override=None):
+        # With cent_override (per-episode random goals) always rebuild and DON'T touch the
+        # baked cache, so repeated calls with different goals stay correct.
+        if cent_override is not None:
+            return self._to_stlpy(self.ast, cent_override=cent_override)
         # catch already converted form
         if self.stlpy_form is None:
             self.stlpy_form = self._to_stlpy(self.ast)
 
         return self.stlpy_form
 
-    def _to_stlpy(self, ast) -> STLTree:
+    def _to_stlpy(self, ast, cent_override=None) -> STLTree:
         if self._is_leaf(ast):
             ast: AST = ast
-            self.stlpy_form = ast.get_stlpy_form()
-            return self.stlpy_form
+            return ast.get_stlpy_form(cent_override=cent_override)
 
         if ast[0] == OP_SYMBOLS["~"]:
-            self.stlpy_form = self._convert_not(ast)
+            form = self._convert_not(ast, cent_override)
         elif ast[0] == OP_SYMBOLS["G"]:
-            self.stlpy_form = self._convert_always(ast)
+            form = self._convert_always(ast, cent_override)
         elif ast[0] == OP_SYMBOLS["F"]:
-            self.stlpy_form = self._convert_eventually(ast)
+            form = self._convert_eventually(ast, cent_override)
         elif ast[0] == OP_SYMBOLS["&"]:
-            self.stlpy_form = self._convert_and(ast)
+            form = self._convert_and(ast, cent_override)
         elif ast[0] == OP_SYMBOLS["|"]:
-            self.stlpy_form = self._convert_or(ast)
+            form = self._convert_or(ast, cent_override)
         elif ast[0] == OP_SYMBOLS["->"]:
-            self.stlpy_form = self._convert_implies(ast)
+            form = self._convert_implies(ast, cent_override)
         elif ast[0] == OP_SYMBOLS["U"]:
-            self.stlpy_form = self._convert_until(ast)
+            form = self._convert_until(ast, cent_override)
         else:
             raise ValueError(f"Unknown operator {ast[0]}")
 
-        return self.stlpy_form
+        if cent_override is None:
+            self.stlpy_form = form
+        return form
 
-    def _convert_not(self, ast):
-        sub_form = self._to_stlpy(ast[1])
+    def _convert_not(self, ast, cent_override=None):
+        sub_form = self._to_stlpy(ast[1], cent_override=cent_override)
         return sub_form.negation()
 
-    def _convert_and(self, ast):
-        sub_form_1 = self._to_stlpy(ast[1])
-        sub_form_2 = self._to_stlpy(ast[2])
+    def _convert_and(self, ast, cent_override=None):
+        sub_form_1 = self._to_stlpy(ast[1], cent_override=cent_override)
+        sub_form_2 = self._to_stlpy(ast[2], cent_override=cent_override)
         return sub_form_1 & sub_form_2
 
-    def _convert_or(self, ast):
-        sub_form_1 = self._to_stlpy(ast[1])
-        sub_form_2 = self._to_stlpy(ast[2])
+    def _convert_or(self, ast, cent_override=None):
+        sub_form_1 = self._to_stlpy(ast[1], cent_override=cent_override)
+        sub_form_2 = self._to_stlpy(ast[2], cent_override=cent_override)
         return sub_form_1 | sub_form_2
 
-    def _convert_implies(self, ast):
-        sub_form_1 = self._to_stlpy(ast[1])
-        sub_form_2 = self._to_stlpy(ast[2])
+    def _convert_implies(self, ast, cent_override=None):
+        sub_form_1 = self._to_stlpy(ast[1], cent_override=cent_override)
+        sub_form_2 = self._to_stlpy(ast[2], cent_override=cent_override)
         return sub_form_1.negation() | sub_form_2
 
-    def _convert_eventually(self, ast):
-        sub_form = self._to_stlpy(ast[1])
+    def _convert_eventually(self, ast, cent_override=None):
+        sub_form = self._to_stlpy(ast[1], cent_override=cent_override)
         return sub_form.eventually(ast[2], ast[3] - 1)
 
-    def _convert_always(self, ast):
-        sub_form = self._to_stlpy(ast[1])
+    def _convert_always(self, ast, cent_override=None):
+        sub_form = self._to_stlpy(ast[1], cent_override=cent_override)
         return sub_form.always(ast[2], ast[3] - 1)
 
-    def _convert_until(self, ast):
-        sub_form_1 = self._to_stlpy(ast[1])
-        sub_form_2 = self._to_stlpy(ast[2])
+    def _convert_until(self, ast, cent_override=None):
+        sub_form_1 = self._to_stlpy(ast[1], cent_override=cent_override)
+        sub_form_2 = self._to_stlpy(ast[2], cent_override=cent_override)
         return sub_form_1.until(sub_form_2, ast[3], ast[4] - 1)
 
     @staticmethod
