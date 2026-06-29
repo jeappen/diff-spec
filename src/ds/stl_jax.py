@@ -267,8 +267,13 @@ class RectAvoidPredicate(RectangularPredicate):
     def __str__(self) -> str:
         return f"Obs {self.name}"
 
-    def get_stlpy_form(self) -> STLTree:
-        """Use Numpy to ensure compatibility with STLpy."""
+    def get_stlpy_form(self, cent_override=None) -> STLTree:
+        """Use Numpy to ensure compatibility with STLpy.
+
+        ``cent_override`` accepted for signature compatibility (``_to_stlpy`` forwards
+        it to every leaf) but IGNORED: avoid predicates are obstacles, not the goals
+        being randomized, so they keep their baked center.
+        """
         bounds = np.stack(
             [self.cent - self.size * (2 - self.shrink_factor) / 2, self.cent + self.size * (2 - self.shrink_factor) / 2]
         ).T.flatten()
