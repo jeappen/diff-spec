@@ -163,12 +163,19 @@ class RectReachPredicate(RectangularPredicate):
             ``self.cent``. This lets the goal coordinates flow as a *dynamic* jit
             argument so changing them does not retrigger compilation, while the
             formula structure stays static. ``None`` reproduces the original
-            behaviour exactly.
+            behaviour exactly. A 2-tuple ``(cents, sizes)`` additionally overrides
+            the rectangle size with ``sizes[self.name]`` (same dynamic-arg
+            semantics); a plain array keeps the baked size.
         """
         assert len(path.shape) == 3, "motion must be in batch"
         eval_path = path[:, start_t:end_t]
+        _size = self.size_tensor
         if cent_override is not None and self.name >= 0:
-            _cent = ds_utils.default_tensor(cent_override[self.name])
+            if isinstance(cent_override, tuple):
+                _cent = ds_utils.default_tensor(cent_override[0][self.name])
+                _size = ds_utils.default_tensor(cent_override[1][self.name])
+            else:
+                _cent = ds_utils.default_tensor(cent_override[self.name])
         else:
             _cent = self.cent_tensor
 
@@ -179,7 +186,7 @@ class RectReachPredicate(RectangularPredicate):
                 shrink_multiplier = 1 / jnp.sqrt(2)
             else:
                 shrink_multiplier = 1
-            return jnp.linalg.norm(self.size_tensor * self.shrink_factor * shrink_multiplier / 2,
+            return jnp.linalg.norm(_size * self.shrink_factor * shrink_multiplier / 2,
                                    ord=SHRINK_NORM) - jnp.linalg.norm(
                 _eval_path - _cent, axis=-1, ord=SHRINK_NORM)
             # # Adding shrink factor to make it more conservative
@@ -198,7 +205,7 @@ class RectReachPredicate(RectangularPredicate):
 
         def without_shrink(_eval_path):
             return jnp.min(
-                self.size_tensor / 2 - jnp.abs(_eval_path - _cent), axis=-1
+                _size / 2 - jnp.abs(_eval_path - _cent), axis=-1
             )
 
         res = jax.lax.cond(train_mode, with_shrink, without_shrink, eval_path)
@@ -212,12 +219,19 @@ class RectReachPredicate(RectangularPredicate):
         When provided and this is a real goal (``name >= 0``), the MILP box is centered
         on ``cent_override[self.name]`` instead of the baked ``self.cent`` -- so STLPY
         solves the SAME random goals the diffusion guidance uses, on the same formula.
+        A 2-tuple ``(cents, sizes)`` additionally overrides the box size with
+        ``sizes[self.name]``; a plain array keeps the baked size.
         """
         cent = self.cent
+        size = self.size
         if cent_override is not None and self.name >= 0:
-            cent = np.asarray(cent_override[self.name], dtype=np.float64)
+            if isinstance(cent_override, tuple):
+                cent = np.asarray(cent_override[0][self.name], dtype=np.float64)
+                size = np.asarray(cent_override[1][self.name], dtype=np.float64)
+            else:
+                cent = np.asarray(cent_override[self.name], dtype=np.float64)
         bounds = np.stack(
-            [cent - self.size * self.shrink_factor / 2, cent + self.size * self.shrink_factor / 2]
+            [cent - size * self.shrink_factor / 2, cent + size * self.shrink_factor / 2]
         ).T.flatten()
         return inside_npy(bounds, 0, 1, 2, self.name)
 
