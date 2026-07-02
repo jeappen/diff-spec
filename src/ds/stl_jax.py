@@ -575,8 +575,15 @@ class STL:
         if op == OP_SYMBOLS["G"]:
             # add end time from inner formula
             return ast[-1] + self._get_end_time(ast[1])
+        elif op == OP_SYMBOLS["F"]:
+            # F reads the inner formula's window at every shift, so the true
+            # horizon nests like G: F[a,b](G[c,d] phi) reads up to b + d.
+            return ast[-1] + self._get_end_time(ast[1])
         elif op in self.sequence_operators:
-            # The last two elements are the start and end times
+            # The last two elements are the start and end times. NOTE (until):
+            # U reports its own window end only; callers clamp the nested
+            # forward window so reads stay within the fixed-length plan (see
+            # the signal spec's prog_w clamp in gcbfplus stl_mixin).
             return ast[-1]
         elif op == OP_SYMBOLS["~"]:
             return self._get_end_time(ast[1])
@@ -904,7 +911,23 @@ class STL:
         return form
 
     def _convert_not(self, ast, cent_override=None):
-        sub_form = self._to_stlpy(ast[1], cent_override=cent_override)
+        sub = ast[1]
+        if self._is_leaf(sub) and isinstance(sub, RectReachPredicate):
+            # stlpy requires positive normal form, so push the negation into the
+            # reach leaf: NOT(inside box) == outside box (the avoid form). Same
+            # bounds as RectReachPredicate.get_stlpy_form, incl. cent_override.
+            cent, size = sub.cent, sub.size
+            if cent_override is not None and sub.name >= 0:
+                if isinstance(cent_override, tuple):
+                    cent = np.asarray(cent_override[0][sub.name], dtype=np.float64)
+                    size = np.asarray(cent_override[1][sub.name], dtype=np.float64)
+                else:
+                    cent = np.asarray(cent_override[sub.name], dtype=np.float64)
+            bounds = np.stack(
+                [cent - size * sub.shrink_factor / 2, cent + size * sub.shrink_factor / 2]
+            ).T.flatten()
+            return outside_npy(bounds, 0, 1, 2, sub.name)
+        sub_form = self._to_stlpy(sub, cent_override=cent_override)
         return sub_form.negation()
 
     def _convert_and(self, ast, cent_override=None):
